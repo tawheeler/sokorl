@@ -1,0 +1,7 @@
+*.ipynb
+analysis
+models
+tasks
+training_entries
+validation
+
