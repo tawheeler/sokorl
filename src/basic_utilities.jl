@@ -69,6 +69,20 @@ function dir_to_char(dir::Direction)::Char
     return retval
 end
 
+function char_to_dir(c::Char)::Direction
+    retval = DIR_UP
+    if c == '↑'
+        retval = DIR_UP
+    elseif c == '←'
+        retval = DIR_LEFT
+    elseif c == '↓'
+        retval = DIR_DOWN
+    elseif c == '→'
+        retval = DIR_RIGHT
+    end
+    return retval
+end
+
 """
 Convert a dx and dy between two tiles to a direction
 """

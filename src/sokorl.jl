@@ -28,44 +28,7 @@ PreTrain:  Train a Level 0 policy in a supervised fassion. Here, we exactly solv
     right action and steps remaining. This should include problems that cannot be solved.
 =#
 
-const DIR_UNDO = 0x05 # Not a real direction, but it is an action.
-
-function dir_to_char_with_undo(dir::Direction)::Char
-    retval = '?'
-    if dir == DIR_UP
-        retval = 'U'
-    elseif dir == DIR_LEFT
-        retval = 'L'
-    elseif dir == DIR_DOWN
-        retval = 'D'
-    elseif dir == DIR_RIGHT
-        retval = 'R'
-    elseif dir == DIR_UNDO
-        retval = 'x'
-    end
-    return retval
-end
-
-function char_to_dir_with_undo(c::Char)::Direction
-    if c == 'U'
-        return DIR_UP
-    elseif c == 'L'
-        return DIR_LEFT
-    elseif c == 'D'
-        return DIR_DOWN
-    elseif c == 'R'
-        return DIR_RIGHT
-    end
-    return DIR_UNDO
-end
-
-function rotr90_dir_with_undo(dir::Direction, k::Integer)
-    if dir == DIR_UNDO
-        return DIR_UNDO
-    end
-    return mod1(dir - k, N_DIRS)
-end
-
+# --------------------------------------------------------------------------
 
 function place_all_boxes_on_goals!(board::Board)
     for (□,v) in enumerate(board)
@@ -119,61 +82,6 @@ end
 
 # --------------------------------------------------------------------------
 
-# A special state that supports undos
-mutable struct RLState
-    state::State
-    moves::Vector{Direction} # The stack of moves applied thus far
-    was_push::BitVector      # Whether each move was a push
-end
-
-function RLState(state::State)
-    return RLState(state, Direction[], falses(0))
-end
-
-"""
-Apply the given move, supporting the undo action.
-If the move is invalid, then do not do anything.
-"""
-function maybe_move!(rlstate::RLState, game::Game, dir::Direction)::Bool
-    if dir != DIR_UNDO
-        # A normal move.
-        succeeded = maybe_move!(rlstate.state, game, dir)
-
-        if succeeded # only moves that succeed are pushed for possible undoing
-            ▩ = rlstate.state.□_player + game.step_fore[dir] # where the player potentially ends up
-            is_push = ((rlstate.state.board[▩] & WALL) == 0) &&
-                      ((rlstate.state.board[▩] & BOX) > 0) &&
-                      succeeded
-            push!(rlstate.moves, dir)
-            push!(rlstate.was_push, is_push)
-        end
-
-        return succeeded
-    end
-    # Otherwise, process the undo action.
-
-    if length(rlstate.moves) == 0
-        # Cannot undo if we don't have previous moves.
-        # Do nothing
-        return false
-    end
-
-    # Pop the last move.
-    dir = pop!(rlstate.moves)
-    was_push = pop!(rlstate.was_push)
-    if was_push
-        ▩_box = rlstate.state.□_player + game.step_fore[dir] # where the box ended up
-        i_box = findfirst(isequal(▩_box), rlstate.state.□_boxes)
-        push = Push(i_box, dir)
-        unmove!(rlstate.state, game, push)
-        return true
-    else # not a push
-        return maybe_move!(rlstate.state, game, OPPOSITE_DIRECTION[dir])
-    end
-end
-
-# --------------------------------------------------------------------------
-
 """
 We accomplished our goal if all goals in 's_goal' have boxes on them in 'board'.
 """
@@ -188,19 +96,13 @@ end
 
 # --------------------------------------------------------------------------
 
-# A training entry is an initial board, a goal, a sequence of moves, and whether the board ends up solved.
+# A training entry is an initial board, a goal, and a sequence of moves.
 # If the problem is unsolved, there will be no moves.
-
-# If the problem it solves, the moves may contain undos. When that happens, we can either generate
-# training examples without the undos (where we back up and remove the action that led to them),
-# or we can include the undo but mask the bad action out so we don't learn to execute it.
 
 struct TrainingEntry
     s_start::Board
     s_goal::Board
     moves::Vector{Direction}
-    bad_moves::BitVector # if set, then a given move should not be encouraged when training
-    solved::Bool
 end
 
 function to_text(entry::TrainingEntry)::String
@@ -212,17 +114,9 @@ function to_text(entry::TrainingEntry)::String
     println(fout, "goal:")
     println(fout, board_to_text(entry.s_goal))
 
-    println(fout, entry.solved ? "solved" : "unsolved")
-
     print(fout, "moves: ")
     for dir in entry.moves
-        print(fout, dir_to_char_with_undo(dir))
-    end
-    println(fout, "")
-
-    print(fout, "isbad: ")
-    for is_bad in entry.bad_moves
-        print(fout, is_bad ? 'x' : '-')
+        print(fout, dir_to_char(dir))
     end
     println(fout, "")
 
@@ -230,18 +124,12 @@ function to_text(entry::TrainingEntry)::String
 end
 
 function print_summary(entry::TrainingEntry)
-    println("solved: ", entry.solved)
     println("moves:")
     print("\t")
     for dir in entry.moves
-        print(dir_to_char_with_undo(dir), " ")
+        print(dir_to_char(dir), " ")
     end
     println("")
-    print("\t")
-    for is_bad in entry.bad_moves
-        print(is_bad ? "B " : ". ")
-    end
-    println("\n")
 end
 
 # Create a new training entry that is based on the given training entry, rotated
@@ -250,9 +138,7 @@ function rotate_training_entry(entry::TrainingEntry, nsteps::Int)
     return TrainingEntry(
             rotr90(entry.s_start, nsteps),
             rotr90(entry.s_goal, nsteps),
-            rotr90_dir_with_undo.(entry.moves, nsteps),
-            copy(entry.bad_moves),
-            entry.solved)
+            rotr90_dir.(entry.moves, nsteps))
 end
 
 # Create a new training entry that is based on the given training entry, transposed.
@@ -260,9 +146,7 @@ function transpose_training_entry(entry::TrainingEntry)
     return TrainingEntry(
             entry.s_start',
             entry.s_goal',
-            transpose_dir.(entry.moves),
-            copy(entry.bad_moves),
-            entry.solved)
+            transpose_dir.(entry.moves))
 end
 
 # Any given training entry can be rotated or transposed to produce 8 different training entries.
@@ -282,20 +166,15 @@ function diversify_dataset!(training_entries::Vector)
     return training_entries
 end
 
-# Load a training entry .txt file, which may contain multiple solution examples.
-function load_training_entries(filename::String)
-    entries = TrainingEntry[]
-
+# Load a training entry .txt file
+function load_training_entry(filename::String)
     # Open the file and read the contents
     lines = readlines(filename)
     n_lines = length(lines)
 
     # Expect the first line to be "start"
     i_line = 1
-    if lines[i_line] != "start:"
-        @show "exit at bad start"
-        return entries
-    end
+    @assert lines[i_line] == "start:"
     i_line += 1
 
     # Load the start board
@@ -313,10 +192,7 @@ function load_training_entries(filename::String)
     s_start = Game(join(board_lines, "\n")).board_start
 
     # Expect the next line to be "goal:"
-    if lines[i_line] != "goal:"
-        @show "exit at bad goal"
-        return entries
-    end
+    @assert lines[i_line] == "goal:"
     i_line += 1
 
     # Load the goal board
@@ -333,43 +209,18 @@ function load_training_entries(filename::String)
 
     s_goal = Game(join(board_lines, "\n")).board_start
 
-    # Now keep parsing solved/moves/isbad
-    while i_line <= n_lines - 2
 
-        line = strip(lines[i_line])
-        i_line += 1
-        solved = line == "solved"
-
-        line = strip(lines[i_line])
-        i_line += 1
-        if !startswith(line, "moves:")
-            @show "exit at bad moves"
-            return entries
-        end
-        if length(line) > 7
-            moves = [char_to_dir_with_undo(c) for c in line[8:end]]
-        else
-            moves = Direction[]
-        end
-
-        line = strip(lines[i_line])
-        i_line += 1
-        if !startswith(line, "isbad:")
-            @show "exit at bad isbad"
-            return entries
-        end
-        if length(line) > 7
-            isbads = [c != '-' for c in line[8:end]]
-        else
-            isbads = falses(0)
-        end
-
-        push!(entries, TrainingEntry(copy(s_start), copy(s_goal), moves, isbads, solved))
-
-        i_line += 1
+    line = strip(lines[i_line])
+    i_line += 1
+    @assert startswith(line, "moves:")
+    if length(line) > 7
+        moves = [char_to_dir(c) for c in line[8:end]]
+    else
+        moves = Direction[]
     end
 
-    return entries
+
+    return TrainingEntry(copy(s_start), copy(s_goal), moves)
 end
 
 function get_maximum_sequence_length(training_entries::Vector{TrainingEntry})
@@ -396,13 +247,11 @@ function construct_solved_training_entry(game::Game, solve_data::AStarData)
         deepcopy(game.board_start),
         goal_board,
         moves,
-        falses(length(moves)), # no bad moves
-        solve_data.solved
     )
 end
 
 function construct_failed_training_entry(game::Game)
-    # Construct the goal, which has the goals on the boxes
+    # Construct the goal, which has the boxes on the goals
     goal_board = deepcopy(game.board_start)
     for (□, v) in enumerate(goal_board)
         if (v & BOX) > 0
@@ -422,8 +271,6 @@ function construct_failed_training_entry(game::Game)
         deepcopy(game.board_start), # s_start
         deepcopy(goal_board), # s_goal
         Direction[],
-        falses(0),
-        false
     )
 end
 
@@ -805,7 +652,7 @@ function load_training_set(directory::String)
             append!(entries, load_training_set(fullpath))
         elseif isfile(fullpath)
             if endswith(content, ".txt")
-                append!(entries, load_training_entries(fullpath))
+                push!(entries, load_training_entry(fullpath))
             end
         end
     end
@@ -824,7 +671,7 @@ function load_training_set2(directory::String)
             append!(entries, load_training_set2(fullpath))
         elseif isfile(fullpath)
             if endswith(content, ".txt")
-                append!(entries, load_training_entries2(fullpath))
+                push!(entries, load_training_entry2(fullpath))
             end
         end
     end
@@ -840,89 +687,41 @@ function produce_unsolved_training_entry(s_start::Board, s_goal::Board)
     return TrainingEntry(
         s_start,
         s_goal,
-        Direction[],
-        falses(0), # bad moves
-        false, # not solved
+        Direction[]
         )
 end
 
 # Look at the given solution.
 # If it does solve the problem, then we want to retain it as a solution.
-# We retain 2 versions:
-#    1. a cleaned version where we remove undos and invalid moves
-#    2. the original version, with undos and invalid moves marked as bad
-function produce_training_entries_from_rollout(
+# We retain a cleaned version where we remove invalid moves.
+function produce_training_entry_from_rollout(
     s_start::Board,
     s_goal::Board,
     moves::Vector{Direction}
-  )::Vector{TrainingEntry}
-    training_entries = TrainingEntry[]
+  )::Union{TrainingEntry, Nothing}
 
     game = Game(s_start)
     state = State(game, deepcopy(game.board_start))
-    rlstate = RLState(state)
 
-    # Run through the game, marking bad moves
-    bad_moves = falses(length(moves))
-    succeededs = falses(length(moves))
+    # Run through the game, skipping bad moves
+    good_moves = Direction[]
 
-    for (i_move, dir) in enumerate(moves)
-        succeeded = maybe_move!(rlstate, game, dir)
-        succeededs[i_move] = succeeded
-
-        # if a move does not succeed, it is bad
-        if !succeeded
-            bad_moves[i_move] = true
+    for dir in moves
+        succeeded = maybe_move!(state, game, dir)
+        if succeeded
+            push!(good_moves, dir)
         end
-
-        # if a move is an undo, then the previous (successful non-undo) move is bad
-        if dir == DIR_UNDO
-            # Go back in time and find a previous successful move to undo.
-            # Note that it is possible for this to be misleading, as we may undo what ends up being the right move.
-            i_move_prev = i_move - 1
-            while i_move_prev > 1
-                if succeededs[i_move_prev] && moves[i_move_prev] != DIR_UNDO
-                    break
-                end
-                i_move_prev -= 1
-            end
-            if i_move_prev > 0
-                bad_moves[i_move_prev] = true
-                succeededs[i_move_prev] = false
-            end
-        end
-
     end
 
     # Verify that the game is solved at the end
-    solved = completed_goal(rlstate.state.board, s_goal)
+    solved = completed_goal(state.board, s_goal)
 
     if !solved
-        # no training entries if not solved
-        return training_entries
+        # no training entry if not solved
+        return nothing
     end
 
-    # Store the provided moves as a training entry, with bad moves marked
-    push!(training_entries, TrainingEntry(
-        s_start,
-        s_goal,
-        moves,
-        bad_moves,
-        true,
-        ))
-
-    # If there were some bad moves, clean it up and include an additional clean entry
-    if any(bad_moves)
-        push!(training_entries, TrainingEntry(
-            s_start,
-            s_goal,
-            rlstate.moves,
-            falses(length(rlstate.moves)),
-            true
-            ))
-    end
-
-    return training_entries
+    return TrainingEntry(s_start, s_goal, good_moves)
 end
 
 
@@ -931,16 +730,17 @@ end
 function set_board_input!(
         inputs::Array{Float32}, # 8×8×5×s×b
         board::Board,
-        seq_index::Int,
-        batch_index::Int)
-    for row in 1:8
-        for col in 1:8
+        i_seq::Int,
+        i_batch::Int)
+    ncols, nrows = size(board)
+    for row in 1:nrows
+        for col in 1:ncols
             v = board[col, row]
-            inputs[col, row, 1, seq_index, batch_index] = Float32((v & BOX) > 0)
-            inputs[col, row, 2, seq_index, batch_index] = Float32((v & FLOOR) > 0)
-            inputs[col, row, 3, seq_index, batch_index] = Float32((v & GOAL) > 0)
-            inputs[col, row, 4, seq_index, batch_index] = Float32((v & PLAYER) > 0)
-            inputs[col, row, 5, seq_index, batch_index] = Float32((v & WALL) > 0)
+            inputs[col, row, 1, i_seq, i_batch] = Float32((v & BOX) > 0)
+            inputs[col, row, 2, i_seq, i_batch] = Float32((v & FLOOR) > 0)
+            inputs[col, row, 3, i_seq, i_batch] = Float32((v & GOAL) > 0)
+            inputs[col, row, 4, i_seq, i_batch] = Float32((v & PLAYER) > 0)
+            inputs[col, row, 5, i_seq, i_batch] = Float32((v & WALL) > 0)
         end
     end
     return inputs
@@ -949,16 +749,17 @@ end
 function set_board_from_input!(
         board::Board,
         inputs::Array{Float32}, # 8×8×5×s×b
-        seq_index::Int,
-        batch_index::Int)
-    for row in 1:8
-        for col in 1:8
+        i_seq::Int,
+        i_batch::Int)
+    ncols, nrows = size(board)
+    for row in 1:nrows
+        for col in 1:ncols
             board[col, row] =
-                (inputs[col, row, 1, seq_index, batch_index] > 0) * BOX +
-                (inputs[col, row, 2, seq_index, batch_index] > 0) * FLOOR +
-                (inputs[col, row, 3, seq_index, batch_index] > 0) * GOAL +
-                (inputs[col, row, 4, seq_index, batch_index] > 0) * PLAYER +
-                (inputs[col, row, 5, seq_index, batch_index] > 0) * WALL
+                (inputs[col, row, 1, i_seq, i_batch] > 0) * BOX +
+                (inputs[col, row, 2, i_seq, i_batch] > 0) * FLOOR +
+                (inputs[col, row, 3, i_seq, i_batch] > 0) * GOAL +
+                (inputs[col, row, 4, i_seq, i_batch] > 0) * PLAYER +
+                (inputs[col, row, 5, i_seq, i_batch] > 0) * WALL
         end
     end
     return board
@@ -1055,6 +856,8 @@ function (m::PolicyTransformerLayer)(
 end
 
 # --------------------------------------------------------------------------
+# Create a mask that attends to the current and all previous inputs
+#  mask[i,j] means input j attends to input i
 function basic_causal_mask(dim::Int)
     mask = Matrix{Bool}(undef, dim, dim)
     fill!(mask, false)
@@ -1067,6 +870,7 @@ function basic_causal_mask(dim::Int)
 end
 
 # Create a mask that only attends to the current input and the goal (input 1)
+#  mask[i,j] means input j attends to input i
 function input_only_mask(dim::Int)
     mask = Matrix{Bool}(undef, dim, dim)
     fill!(mask, false)
@@ -1079,19 +883,19 @@ end
 
 # --------------------------------------------------------------------------
 
-# Define the full policy
+# The Level-0 Policy
 struct SokobanPolicyLevel0
-    batch_size::Int   # batch size
-    max_seq_len::Int  # maximum input length, in number of tokens
-    encoding_dim::Int # dimension of the embedding space
+    batch_size::Int   # b, batch size
+    max_seq_len::Int  # s, maximum input length, in number of tokens
+    encoding_dim::Int # e, dimension of the embedding space
 
     encoder::Chain
     pos_enc::AbstractMatrix{Float32}
     dropout::Dropout
     mask::AbstractMatrix{Bool} # causal mask, [s × s], mask[i,j] means input j attends to input i
     trunk::Vector{PolicyTransformerLayer}
-    action_head::Dense # {up,left,down,right,undo}, produces logits
-    nsteps_head::Dense # P(min(round(log(n+1)), 5)) plus inf, produces logits
+    action_head::Dense # logits for our 4 actions: {up,left,down,right}
+    nsteps_head::Dense # logits for the number of remaining steps, plus inf: P(min(round(log(n+1)), 5)) plus inf
 end
 
 Flux.@functor SokobanPolicyLevel0
@@ -1101,57 +905,64 @@ function SokobanPolicyLevel0(;
         max_seq_len::Int = 32,
         encoding_dim::Int = 8,
         num_trunk_layers::Int = 3,
+        n_mha_heads::Int = 8,
+        trunk_hidden_dim_scale::Int = 4,
+        encoder_conv_dim::Int = 8,
         init = Flux.glorot_uniform,
         dropout_prob::Float64 = 0.0,
         no_past_info::Bool = false, # if true, we create a causal mask that only attends to the current input and the goal
         )
 
-    norm_enc = Flux.LayerNorm(encoding_dim)
+    e = encoding_dim
+    f = encoder_conv_dim
+    b = batch_size
+    s = max_seq_len
 
+    norm_enc = Flux.LayerNorm(e)
+    dropout = Dropout(dropout_prob)
+    pos_enc = positional_encoding(s, e)
+    mask = no_past_info ? input_only_mask(s) : basic_causal_mask(s)
+
+    # The encoder encodes the states into token embeddings (8×8×5×s×b →  e×s×b)
     encoder = Chain(
         # 8×8×5×s×b
         x -> reshape(x, size(x)[1], size(x)[2], size(x)[3], size(x)[4]*size(x)[5]),
         # 8×8×5×sb
-        Conv((5,5), 5=>8, relu, stride=1, pad=2),
-        # 8×8×8×sb
-        Conv((5,5), 8=>8, relu, stride=1, pad=2),
-        # 8×8×8×sb
-        Conv((5,5), 8=>2, relu, stride=1, pad=2),
+        Conv((5,5), 5=>f, relu, stride=1, pad=2),
+        # 8×8×f×sb
+        Conv((5,5), f=>f, relu, stride=1, pad=2),
+        # 8×8×f×sb
+        Conv((5,5), f=>2, relu, stride=1, pad=2),
         # 8×8×2×sb
-        x -> reshape(Flux.flatten(x), 128, max_seq_len, batch_size),
+        x -> reshape(Flux.flatten(x), 128, s, b),
         # 128×s×b (Dense layer expects inputs as (features, batch), thus another reshape is needed)
         x -> reshape(x, :, size(x, 2)*size(x, 3)),
         # 128×sb
-        Dense(128 => encoding_dim, relu),
-        # d×sb
-        x -> reshape(x, encoding_dim, max_seq_len, batch_size),
-        # d×s×b
+        Dense(128 => e, relu),
+        # e×sb
+        x -> reshape(x, e, s, b),
+        # e×s×b
         x -> norm_enc(x)
     )
 
-    dropout = Dropout(dropout_prob)
-
-    mask = basic_causal_mask(max_seq_len)
-    if no_past_info
-        mask = input_only_mask(max_seq_len)
-    end
-
-    pos_enc = positional_encoding(max_seq_len, encoding_dim)
-
+    # The trunk is the workhorse of the transformer, and iteratively
+    # applies self-attention and skip-connection nonlinearities
     trunk = Array{PolicyTransformerLayer}(undef, num_trunk_layers)
     for i_trunk_layer in 1:num_trunk_layers
-        trunk[i_trunk_layer] = PolicyTransformerLayer(encoding_dim, init=init, dropout_prob=dropout_prob)
+        trunk[i_trunk_layer] = PolicyTransformerLayer(
+            encoding_dim, init=init, dropout_prob=dropout_prob,
+            nheads=n_mha_heads, hidden_dim_scale=trunk_hidden_dim_scale)
     end
 
-    action_head = Dense(encoding_dim => 5; bias=true, init=init)
-    nsteps_head = Dense(encoding_dim => 7; bias=true, init=init)
+    action_head = Dense(e => 4; bias=true, init=init)
+    nsteps_head = Dense(e => 7; bias=true, init=init)
 
     return SokobanPolicyLevel0(
         batch_size, max_seq_len, encoding_dim,
         encoder, pos_enc, dropout, mask, trunk, action_head, nsteps_head)
 end
 
-function (m::SokobanPolicyLevel0)(input::AbstractArray{Float32, 5}) # [8 × 8 × 5 × ntokens × batch_size]
+function (m::SokobanPolicyLevel0)(input::AbstractArray{Float32, 5}) # [8×8×5×s×b]
 
     X = m.encoder(input) .+ m.pos_enc
     X = m.dropout(X)
@@ -1160,23 +971,23 @@ function (m::SokobanPolicyLevel0)(input::AbstractArray{Float32, 5}) # [8 × 8 ×
         X = layer(X, m.mask)
     end
 
-    action_logits = m.action_head(X) # [5 × ntokens × batch_size]
-    nsteps_logits = m.nsteps_head(X) # [7 × ntokens × batch_size]
+    action_logits = m.action_head(X) # [4×s×b]
+    nsteps_logits = m.nsteps_head(X) # [7×s×b]
 
     return (action_logits, nsteps_logits)
 end
 
 struct SokobanPolicyLevel0Data
-    inputs::AbstractArray{Float32} # 8 × 8 × 5 × max_seq_len × batch_size
-    policy_target::AbstractArray{Float32}  # 5 × max_seq_len × batch_size
-    nsteps_target::AbstractArray{Float32}  # 7 × max_seq_len × batch_size
-    policy_mask::AbstractArray{Int32}      # 5 × max_seq_len × batch_size
-    nsteps_mask::AbstractArray{Int32}      # 7 × max_seq_len × batch_size
+    inputs::AbstractArray{Float32}     # 8×8×5×s×b
+    policy_target::AbstractArray{Float32}  # 4×s×b
+    nsteps_target::AbstractArray{Float32}  # 7×s×b
+    policy_mask::AbstractArray{Int32}      # 4×s×b # TODO: Switch to UInt8
+    nsteps_mask::AbstractArray{Int32}      # 7×s×b
 end
 
 function SokobanPolicyLevel0Data(max_seq_len::Integer, batch_size::Integer)
     inputs = zeros(Float32, (8, 8, 5, max_seq_len, batch_size))
-    policy_target = zeros(Float32, (5, max_seq_len, batch_size))
+    policy_target = zeros(Float32, (4, max_seq_len, batch_size))
     nsteps_target = zeros(Float32, (7, max_seq_len, batch_size))
     policy_mask = zeros(Int32, size(policy_target))
     nsteps_mask = zeros(Int32, size(nsteps_target))
@@ -1211,68 +1022,67 @@ end
 
 # --------------------------------------------------------------------------
 
+# Unpack a TrainingEntry into the tensor representation used by the model.
 function convert_training_entry!(
-        inputs::Array{Float32},        # 8×8×5×s×b
-        policy_target::Array{Float32}, # 5×s×b
+        inputs::Array{Float32},    # 8×8×5×s×b
+        policy_target::Array{Float32}, # 4×s×b
         nsteps_target::Array{Float32}, # 7×s×b
-        policy_mask::Array{Int32},     # 5×s×b
+        policy_mask::Array{Int32},     # 4×s×b
         nsteps_mask::Array{Int32},     # 7×s×b
         training_entry::TrainingEntry,
         batch_index::Int)
+
+    # Ensure that our training entry is not longer than our model can handle
+    n_moves = length(training_entry.moves)
+    @assert n_moves < size(inputs, 4)
+
+    b = batch_index
+
     # Only train on things we set to 1
-    policy_mask[:, :, batch_index] .= 0
-    nsteps_mask[:, :, batch_index] .= 0
+    policy_mask[:, :, b] .= 0
+    nsteps_mask[:, :, b] .= 0
 
     # The goal always goes into the first entry
-    set_board_input!(inputs, training_entry.s_goal, 1, batch_index)
-    policy_target[:, 1, batch_index] .= 1.0/size(policy_target, 1)
-    nsteps_target[:, 1, batch_index] .= 1.0/size(nsteps_target, 1)
+    set_board_input!(inputs, training_entry.s_goal, 1, b)
+    policy_target[:, 1, b] .= 1.0/size(policy_target, 1)
+    nsteps_target[:, 1, b] .= 1.0/size(nsteps_target, 1)
 
-    # Walk through the game and place the states, only training on good moves.
+    # Walk through the game and place the states
     game = Game(deepcopy(training_entry.s_start))
     state = State(game, game.board_start)
-    rlstate = RLState(state)
 
-    seq_index = 2
-    for (dir, is_bad) in zip(training_entry.moves, training_entry.bad_moves)
-        if seq_index > size(inputs, 4)
-            break
-        end
+    s = 2 # seq index
+    for dir in training_entry.moves
 
-        # println(board_to_text(rlstate.state.board))
-        # println("dir: ", dir_to_char_with_undo(dir), "  ", (is_bad ? "bad" : ""))
-
-        set_board_input!(inputs, rlstate.state.board, seq_index, batch_index)
-        policy_target[:, seq_index, batch_index] .= Float32(0)
-        policy_target[dir, seq_index, batch_index] = Float32(1)
+        set_board_input!(inputs, state.board, s, b)
+        policy_target[:, s, b] .= Float32(0)
+        policy_target[dir, s, b] = Float32(1)
 
 
-        nsteps_target[:, seq_index, batch_index] .= Float32(0)
+        nsteps_target[:, s, b] .= Float32(0)
         nsteps = length(training_entry.moves)
         idx = Int(clamp(round(log(nsteps+1)), 0, 5)) + 1
-        nsteps_target[idx, seq_index, batch_index] = Float32(1)
+        nsteps_target[idx, s, b] = Float32(1)
 
-        policy_mask[:, seq_index, batch_index] .= (is_bad ? 0 : 1) # only train of the action if its good
-        nsteps_mask[:, seq_index, batch_index] .= 1 # always train on the step count (TODO: Is that best?)
+        policy_mask[:, s, b] .= 1 # train on the action
+        nsteps_mask[:, s, b] .= 1 # train on the step count
 
         # Advance the state
-        succeeded = maybe_move!(rlstate, game, dir)
-        if !is_bad
-            @assert succeeded
-        end
-        seq_index += 1
+        succeeded = maybe_move!(state, game, dir)
+        @assert succeeded # we expect valid moves in all training examples
+        s += 1
     end
 
     # Always set the final state (which is the first state in an unsolved entry),
     # but the policy target is not trained on.
-    set_board_input!(inputs, rlstate.state.board, seq_index, batch_index)
-    policy_target[:, seq_index, batch_index] .= 1.0/size(policy_target, 1)
-    nsteps_target[:, seq_index, batch_index] .= Float32(0)
-    nsteps_mask[:, seq_index, batch_index] .= 1
-    if training_entry.solved
-        nsteps_target[1, seq_index, batch_index] = Float32(1) # already solved!
+    set_board_input!(inputs, state.board, s, b)
+    policy_target[:, s, b] .= 1.0/size(policy_target, 1)
+    nsteps_target[:, s, b] .= Float32(0)
+    nsteps_mask[:, s, b] .= 1
+    if n_moves > 0
+        nsteps_target[1, s, b] = Float32(1) # solved.
     else
-        nsteps_target[end, seq_index, batch_index] = Float32(1) # infinite steps to solve w/out undo
+        nsteps_target[end, s, b] = Float32(1) # infinite steps to solve w/out undo
     end
 end
 
@@ -1304,9 +1114,20 @@ end
 
 function load_params(model_directory::AbstractString)
     params = JSON.parsefile(joinpath(model_directory, "params.json"))
+
     if (!haskey(params, "num_trunk_layers"))
         params["num_trunk_layers"] = 3
     end
+    if (!haskey(params, "n_mha_heads"))
+        params["n_mha_heads"] = 8
+    end
+    if (!haskey(params, "trunk_hidden_dim_scale"))
+        params["trunk_hidden_dim_scale"] = 4
+    end
+    if (!haskey(params, "encoder_conv_dim"))
+        params["encoder_conv_dim"] = 8
+    end
+
     return params
 end
 
@@ -1317,10 +1138,13 @@ function load_policy(::Type{SokobanPolicyLevel0}, model_directory::AbstractStrin
         max_seq_len = params["max_seq_len"],
         encoding_dim = params["encoding_dim"],
         num_trunk_layers = params["num_trunk_layers"],
+        n_mha_heads = parmas["n_mha_heads"],
+        trunk_hidden_dim_scale = params["trunk_hidden_dim_scale"],
+        encoder_conv_dim = params["encoder_conv_dim"],
         dropout_prob=params["dropout_prob"],
         no_past_info=params["no_past_info"])
 
-    model_state = JLD2.load(joinpath(model_directory, "model0-checkpoint.jld2"), "model_state");
+    model_state = JLD2.load(joinpath(model_directory, "model0.jld2"), "model_state");
     Flux.loadmodel!(policy, model_state);
 
     return policy
@@ -1329,11 +1153,11 @@ end
 # --------------------------------------------------------------------------
 
 mutable struct BeamSearchData
-    inputs::Array{Float32}  # [8 × 8 × 5 × s × b]
-    moves::Array{Direction} # [s × b]  The move trajectories maintained by beam search
-    scores::Vector{Float32} # [b]      The running log likelihoods for the beam
-    depth::Int              # how deep we got before returning. moves[depth] is the last move we used.
-    solution::Int           # batch index of the trajectory that solves the problem (or -1 otherwise)
+    inputs::Array{Float32}  # [8×8×5×s×b]
+    moves::Array{Direction} #       [s×b]  The move trajectories maintained by beam search
+    scores::Vector{Float32} #         [b]  The running log likelihoods for the beam
+    depth::Int              # How deep we got before returning. moves[depth] is the last move we used.
+    solution::Int           # Batch index of the trajectory that solves the problem (or -1 otherwise)
 end
 
 function beam_search!(
