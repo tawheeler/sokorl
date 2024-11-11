@@ -2,32 +2,6 @@ using Dates
 using Distributions
 using Flux
 
-#=
-
-Deep Learning Components:
-- State Encoder
-- State Decoder
-- Level 0 Policy
-
-The Level 0 Policy
-
-- Inputs:
-    goal state (embeddded) - includes goals, walls
-    current state (embedded) - includes player, boxes, walls
-- Output:
-    Categorical distribution over actions: up/down/left/right/undo
-    Cateogrical distribution over number of actions remaining: P(min(round(log(n+1)), 5))
-        that gives us nice discrete categories, and we know when we think we're done (high P(0))
-- Reward:
-    Receive reward when we reach our goal (r_win)
-    Receive cost whenever we take an action
-    Receive surrogate cost in some training situations where we know the optimal solution
-
-PreTrain:  Train a Level 0 policy in a supervised fassion. Here, we exactly solve a bunch of basic
-    Sokoban boards to get the optimal policy, then train π₀ to maximize the likelihood of the
-    right action and steps remaining. This should include problems that cannot be solved.
-=#
-
 # --------------------------------------------------------------------------
 
 function place_all_boxes_on_goals!(board::Board)
@@ -99,13 +73,13 @@ end
 # A training entry is an initial board, a goal, and a sequence of moves.
 # If the problem is unsolved, there will be no moves.
 
-struct TrainingEntry
+struct TrainingEntry0
     s_start::Board
     s_goal::Board
     moves::Vector{Direction}
 end
 
-function to_text(entry::TrainingEntry)::String
+function to_text(entry::TrainingEntry0)::String
     fout = IOBuffer()
 
     println(fout, "start:")
@@ -123,7 +97,7 @@ function to_text(entry::TrainingEntry)::String
     return String(take!(fout))
 end
 
-function print_summary(entry::TrainingEntry)
+function print_summary(entry::TrainingEntry0)
     println("moves:")
     print("\t")
     for dir in entry.moves
@@ -134,16 +108,16 @@ end
 
 # Create a new training entry that is based on the given training entry, rotated
 # 90 degrees nsteps times.
-function rotate_training_entry(entry::TrainingEntry, nsteps::Int)
-    return TrainingEntry(
+function rotate_training_entry(entry::TrainingEntry0, nsteps::Int)
+    return TrainingEntry0(
             rotr90(entry.s_start, nsteps),
             rotr90(entry.s_goal, nsteps),
             rotr90_dir.(entry.moves, nsteps))
 end
 
 # Create a new training entry that is based on the given training entry, transposed.
-function transpose_training_entry(entry::TrainingEntry)
-    return TrainingEntry(
+function transpose_training_entry(entry::TrainingEntry0)
+    return TrainingEntry0(
             entry.s_start',
             entry.s_goal',
             transpose_dir.(entry.moves))
@@ -220,10 +194,10 @@ function load_training_entry(filename::String)
     end
 
 
-    return TrainingEntry(copy(s_start), copy(s_goal), moves)
+    return TrainingEntry0(copy(s_start), copy(s_goal), moves)
 end
 
-function get_maximum_sequence_length(training_entries::Vector{TrainingEntry})
+function get_maximum_sequence_length(training_entries::Vector{TrainingEntry0})
     return maximum(length(entry.moves) for entry in training_entries)
 end
 
@@ -243,7 +217,7 @@ function construct_solved_training_entry(game::Game, solve_data::AStarData)
     # Remove the player from the goal board
     goal_board[state.□_player] &= ~PLAYER
 
-    return TrainingEntry(
+    return TrainingEntry0(
         deepcopy(game.board_start),
         goal_board,
         moves,
@@ -267,7 +241,7 @@ function construct_failed_training_entry(game::Game)
     # Remove the player from the goal board
     goal_board[game.□_player_start] &= ~PLAYER
 
-    return TrainingEntry(
+    return TrainingEntry0(
         deepcopy(game.board_start), # s_start
         deepcopy(goal_board), # s_goal
         Direction[],
@@ -290,7 +264,7 @@ end
 # training examples without the undos (where we back up and remove the action that led to them),
 # or we can include the undo but mask the bad action out so we don't learn to execute it.
 
-struct TrainingEntry2
+struct TrainingEntry01
     s_start::Board # The starting board
     states::Vector{Board} # In order, from first successor state post s-start to final state.
                           # The model's goal is the final state (sans player).
@@ -301,7 +275,7 @@ struct TrainingEntry2
     solved::Bool          # Whether this training entry ends up solving the problem.
 end
 
-function to_text(entry::TrainingEntry2)::String
+function to_text(entry::TrainingEntry01)::String
     fout = IOBuffer()
 
     println(fout, "start:")
@@ -332,8 +306,8 @@ end
 
 # Create a new training entry that is based on the given training entry, rotated
 # 90 degrees nsteps times.
-function rotate_training_entry(entry::TrainingEntry2, nsteps::Int)
-    return TrainingEntry2(
+function rotate_training_entry(entry::TrainingEntry01, nsteps::Int)
+    return TrainingEntry01(
             rotr90(entry.s_start, nsteps),
             [rotr90(s, nsteps) for s in entry.states],
             [rotr90(s, nsteps) for s in entry.goals],
@@ -342,8 +316,8 @@ function rotate_training_entry(entry::TrainingEntry2, nsteps::Int)
 end
 
 # Create a new training entry that is based on the given training entry, transposed.
-function transpose_training_entry(entry::TrainingEntry2)
-    return TrainingEntry2(
+function transpose_training_entry(entry::TrainingEntry01)
+    return TrainingEntry01(
             entry.s_start',
             [s' for s in entry.states],
             [s' for s in entry.goals],
@@ -354,7 +328,7 @@ end
 # Load a training entry .txt file for higher-order sequences,
 # which will only contain one solution example.
 function load_training_entries2(filename::String)
-    entries = TrainingEntry2[]
+    entries = TrainingEntry01[]
 
     # Open the file and read the contents
     lines = readlines(filename)
@@ -456,14 +430,14 @@ function load_training_entries2(filename::String)
         end
     end
 
-    push!(entries, TrainingEntry2(
+    push!(entries, TrainingEntry01(
         s_start, states, goals, bad_moves, solved
         ))
 
     return entries
 end
 
-function get_maximum_sequence_length(training_entries::Vector{TrainingEntry2})
+function get_maximum_sequence_length(training_entries::Vector{TrainingEntry01})
     return maximum(length(entry.states) for entry in training_entries2)
 end
 
@@ -529,7 +503,7 @@ function construct_solved_training_entry2(game::Game, solve_data::AStarData)
 
     bad_moves = falses(length(states)) # no bad moves
 
-    return TrainingEntry2(s_start, states, goals, bad_moves, solved)
+    return TrainingEntry01(s_start, states, goals, bad_moves, solved)
 end
 
 function construct_failed_training_entry2(game::Game, rng = Random.default_rng())
@@ -576,7 +550,7 @@ function construct_failed_training_entry2(game::Game, rng = Random.default_rng()
         end
     end
 
-    return TrainingEntry2(
+    return TrainingEntry01(
         deepcopy(game.board_start), # s_start
         [deepcopy(goal_board)], # we need some sort of move (which we won't train on), so just use the goal
         [deepcopy(goal_board)], # goal
@@ -644,7 +618,7 @@ end
 
 # Load all of the training entries in a directory and its subdirectories
 function load_training_set(directory::String)
-    entries = TrainingEntry[]
+    entries = TrainingEntry0[]
 
     for content in readdir(directory)
         fullpath = joinpath(directory, content)
@@ -663,7 +637,7 @@ end
 
 # Load all of the training entries in a directory and its subdirectories
 function load_training_set2(directory::String)
-    entries = TrainingEntry2[]
+    entries = TrainingEntry01[]
 
     for content in readdir(directory)
         fullpath = joinpath(directory, content)
@@ -684,7 +658,7 @@ end
 
 # Produce a training entry
 function produce_unsolved_training_entry(s_start::Board, s_goal::Board)
-    return TrainingEntry(
+    return TrainingEntry0(
         s_start,
         s_goal,
         Direction[]
@@ -698,7 +672,7 @@ function produce_training_entry_from_rollout(
     s_start::Board,
     s_goal::Board,
     moves::Vector{Direction}
-  )::Union{TrainingEntry, Nothing}
+  )::Union{TrainingEntry0, Nothing}
 
     game = Game(s_start)
     state = State(game, deepcopy(game.board_start))
@@ -721,7 +695,7 @@ function produce_training_entry_from_rollout(
         return nothing
     end
 
-    return TrainingEntry(s_start, s_goal, good_moves)
+    return TrainingEntry0(s_start, s_goal, good_moves)
 end
 
 
@@ -1022,14 +996,14 @@ end
 
 # --------------------------------------------------------------------------
 
-# Unpack a TrainingEntry into the tensor representation used by the model.
+# Unpack a TrainingEntry0 into the tensor representation used by the model.
 function convert_training_entry!(
         inputs::Array{Float32},    # 8×8×5×s×b
         policy_target::Array{Float32}, # 4×s×b
         nsteps_target::Array{Float32}, # 7×s×b
         policy_mask::Array{Int32},     # 4×s×b
         nsteps_mask::Array{Int32},     # 7×s×b
-        training_entry::TrainingEntry,
+        training_entry::TrainingEntry0,
         batch_index::Int)
 
     # Ensure that our training entry is not longer than our model can handle
@@ -1088,7 +1062,7 @@ end
 
 function convert_training_entry!(
         data::SokobanPolicyLevel0Data,
-        training_entry::TrainingEntry,
+        training_entry::TrainingEntry0,
         batch_index::Int)
     convert_training_entry!(
         data.inputs,
@@ -1419,7 +1393,7 @@ end
 function calc_metrics_gpu(
     policy::SokobanPolicyLevel0,
     data::SokobanPolicyLevel0Data,
-    validation_set::Vector{TrainingEntry},
+    validation_set::Vector{TrainingEntry0},
     )
 
     policy = gpu(policy)
@@ -1547,7 +1521,7 @@ end
 function calc_metrics_gpu(
     policy::SokobanPolicyLevel0,
     data::BeamSearchData,
-    validation_set::Vector{TrainingEntry},
+    validation_set::Vector{TrainingEntry0},
     )
 
     policy = gpu(policy)
