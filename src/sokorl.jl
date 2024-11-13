@@ -53,6 +53,30 @@ function calc_gradient_l2_norm(v::Any)
     return sqrt(calc_gradient_l2_norm_helper(v))
 end
 
+function calc_num_params(item)::Int
+    if item isa NamedTuple
+        sum = 0
+        for val in values(item)
+            sum += calc_num_params(val)
+        end
+        return sum
+    elseif item isa Tuple || item isa Vector
+        sum = 0
+        for entry in item
+            sum += calc_num_params(entry)
+        end
+        return sum
+    elseif item isa AbstractArray{Float32}
+        return length(item)
+    elseif item === nothing
+        return 0
+    elseif item isa Real
+        return 1
+    else
+        error("Unsupported type encountered: $(typeof(item))")
+    end
+end
+
 
 # --------------------------------------------------------------------------
 
@@ -264,18 +288,16 @@ end
 # training examples without the undos (where we back up and remove the action that led to them),
 # or we can include the undo but mask the bad action out so we don't learn to execute it.
 
-struct TrainingEntry01
+struct TrainingEntry1
     s_start::Board # The starting board
     states::Vector{Board} # In order, from first successor state post s-start to final state.
                           # The model's goal is the final state (sans player).
                           # Of length n if there are n actions.
     goals::Vector{Board}  # The goals for each state transition. Also of length n.
-    bad_moves::BitVector  # If set, then a given move should not be encouraged when training
-                          # Also of length n.
     solved::Bool          # Whether this training entry ends up solving the problem.
 end
 
-function to_text(entry::TrainingEntry01)::String
+function to_text(entry::TrainingEntry1)::String
     fout = IOBuffer()
 
     println(fout, "start:")
@@ -295,41 +317,31 @@ function to_text(entry::TrainingEntry01)::String
         println(fout, board_to_text(s))
     end
 
-    print(fout, "isbad: ")
-    for is_bad in entry.bad_moves
-        print(fout, is_bad ? 'x' : '-')
-    end
-    println(fout, "")
-
     return String(take!(fout))
 end
 
 # Create a new training entry that is based on the given training entry, rotated
 # 90 degrees nsteps times.
-function rotate_training_entry(entry::TrainingEntry01, nsteps::Int)
-    return TrainingEntry01(
+function rotate_training_entry(entry::TrainingEntry1, nsteps::Int)
+    return TrainingEntry1(
             rotr90(entry.s_start, nsteps),
             [rotr90(s, nsteps) for s in entry.states],
             [rotr90(s, nsteps) for s in entry.goals],
-            copy(entry.bad_moves),
             entry.solved)
 end
 
 # Create a new training entry that is based on the given training entry, transposed.
-function transpose_training_entry(entry::TrainingEntry01)
-    return TrainingEntry01(
+function transpose_training_entry(entry::TrainingEntry1)
+    return TrainingEntry1(
             entry.s_start',
             [s' for s in entry.states],
             [s' for s in entry.goals],
-            copy(entry.bad_moves),
             entry.solved)
 end
 
 # Load a training entry .txt file for higher-order sequences,
-# which will only contain one solution example.
-function load_training_entries2(filename::String)
-    entries = TrainingEntry01[]
-
+# which will contain one solution example.
+function load_training_entry2(filename::String)
     # Open the file and read the contents
     lines = readlines(filename)
     n_lines = length(lines)
@@ -416,28 +428,12 @@ function load_training_entries2(filename::String)
     end
 
 
-    # Parse isbad
-    bad_moves = falses(0)
-    let
-        line = strip(lines[i_line])
-        i_line += 1
-        if !startswith(line, "isbad:")
-            @show "exit at bad isbad"
-            return entries
-        end
-        if length(line) > 7
-            bad_moves = [c != '-' for c in line[8:end]]
-        end
-    end
-
-    push!(entries, TrainingEntry01(
-        s_start, states, goals, bad_moves, solved
-        ))
-
-    return entries
+    return TrainingEntry1(
+        s_start, states, goals, solved
+        )
 end
 
-function get_maximum_sequence_length(training_entries::Vector{TrainingEntry01})
+function get_maximum_sequence_length(training_entries::Vector{TrainingEntry1})
     return maximum(length(entry.states) for entry in training_entries2)
 end
 
@@ -501,9 +497,7 @@ function construct_solved_training_entry2(game::Game, solve_data::AStarData)
     push!(states, deepcopy(state.board))
     push!(goals, build_goal_board_for_transition(game, state, i_box_active))
 
-    bad_moves = falses(length(states)) # no bad moves
-
-    return TrainingEntry01(s_start, states, goals, bad_moves, solved)
+    return TrainingEntry1(s_start, states, goals, solved)
 end
 
 function construct_failed_training_entry2(game::Game, rng = Random.default_rng())
@@ -550,11 +544,10 @@ function construct_failed_training_entry2(game::Game, rng = Random.default_rng()
         end
     end
 
-    return TrainingEntry01(
+    return TrainingEntry1(
         deepcopy(game.board_start), # s_start
-        [deepcopy(goal_board)], # we need some sort of move (which we won't train on), so just use the goal
+        Board[], # no moves
         [deepcopy(goal_board)], # goal
-        falses(1), # one bad move
         false
     )
 end
@@ -637,7 +630,7 @@ end
 
 # Load all of the training entries in a directory and its subdirectories
 function load_training_set2(directory::String)
-    entries = TrainingEntry01[]
+    entries = TrainingEntry1[]
 
     for content in readdir(directory)
         fullpath = joinpath(directory, content)
