@@ -536,7 +536,7 @@ end
 """
 Identify the box that moved between states s0 and s1.
 Returns the tile index of the box in s0 and s1.
-Returns `nothing` of no boxes or more than 1 box moved.
+Returns `nothing` if no boxes or more than 1 box moved.
 """
 function find_moved_box(A::Board, B::Board)::Union{Nothing, Pair{TileIndex,TileIndex}}
     moved_boxes_a = TileIndex[]
@@ -1109,8 +1109,8 @@ function convert_training_entry!(
 
 
         nsteps_target[:, s, b] .= Float32(0)
-        nsteps = length(training_entry.moves)
-        idx = Int(clamp(round(log(nsteps+1)), 0, 5)) + 1
+        nsteps_remaining = length(training_entry.moves) + 1 - s
+        idx = Int(clamp(round(log(nsteps_remaining+1)), 0, 5)) + 1
         nsteps_target[idx, s, b] = Float32(1)
 
         policy_mask[:, s, b] .= 1 # train on the action
@@ -1187,7 +1187,7 @@ function load_policy(::Type{SokobanPolicyLevel0}, model_directory::AbstractStrin
         max_seq_len = params["max_seq_len"],
         encoding_dim = params["encoding_dim"],
         num_trunk_layers = params["num_trunk_layers"],
-        n_mha_heads = parmas["n_mha_heads"],
+        n_mha_heads = params["n_mha_heads"],
         trunk_hidden_dim_scale = params["trunk_hidden_dim_scale"],
         encoder_conv_dim = params["encoder_conv_dim"],
         dropout_prob=params["dropout_prob"],
@@ -1644,133 +1644,302 @@ function calc_metrics_gpu(
     )
 end
 
+
 # --------------------------------------------------------------------------
+struct GoalEmbeddingHead
+    seeds::AbstractArray{Float32} # learned goal embedding seeds [e×a×1×1]
+    affine1::Dense
+    affine2::Dense
+end
 
-# struct TransformerPolicy2
-#     batch_size::Int   # batch size
-#     max_seq_len::Int  # maximum input length, in number of tokens
-#     encoding_dim::Int # dimension of the embedding space
-#     n_actions::Int    # number of actions that this outputs
+Flux.@functor GoalEmbeddingHead
 
-#     encoder::Chain
-#     pos_enc::AbstractMatrix{Float32}
-#     dropout::Dropout
-#     mask::AbstractMatrix{Bool} # causal mask, [s × s], mask[i,j] means input j attends to input i
-#     trunk::Vector{PolicyTransformerLayer}
-#     goalem_seeds::AbstractMatrix{Float32} # learned goal embedding seeds
-#     action_head::Dense # produces n_actions logits
-#     goalem_head::Dense # produces n_actions goal embeddings
-#     nsteps_head::Dense # P(min(round(log(n+1)), 5)) plus inf, produces logits
-# end
+function GoalEmbeddingHead(encoding_dim::Int, n_actions::Int, hidden_dim_scale::Int; bias=true, init=Flux.glorot_uniform)
+    hidden_dim = encoding_dim * hidden_dim_scale
+    seeds = Float32.(Flux.glorot_uniform(encoding_dim, n_actions, 1, 1))
+    affine1 = Dense(encoding_dim => hidden_dim; bias=bias, init=init)
+    affine2 = Dense(hidden_dim => encoding_dim; bias=bias, init=init)
+    return GoalEmbeddingHead(seeds, affine1, affine2)
+end
 
-# Flux.@functor TransformerPolicy2
+function (m::GoalEmbeddingHead)(X::AbstractArray{Float32, 3}) # [e×s×b]
+    e,s,b = size(X)
 
-# function TransformerPolicy2(;
-#         batch_size::Int = 32,
-#         max_seq_len::Int = 32,
-#         encoding_dim::Int = 8,
-#         num_trunk_layers::Int = 3,
-#         init = Flux.glorot_uniform,
-#         dropout_prob::Float64 = 0.0,
-#         no_past_info::Bool = false, # if true, we create a causal mask that only attends to the current input and the goal
-#         )
+    X = reshape(X, (e, 1, s, b)) # [e×1×s×b]
+    A = X .+ m.seeds # [e×a×s×b]
 
-#     norm_enc = Flux.LayerNorm(encoding_dim)
-
-#     encoder = Chain(
-#         # 8×8×5×s×b
-#         x -> reshape(x, size(x)[1], size(x)[2], size(x)[3], size(x)[4]*size(x)[5]),
-#         # 8×8×5×sb
-#         Conv((5,5), 5=>8, relu, stride=1, pad=2),
-#         # 8×8×8×sb
-#         Conv((5,5), 8=>8, relu, stride=1, pad=2),
-#         # 8×8×8×sb
-#         Conv((5,5), 8=>2, relu, stride=1, pad=2),
-#         # 8×8×2×sb
-#         x -> reshape(Flux.flatten(x), 128, max_seq_len, batch_size),
-#         # 128×s×b (Dense layer expects inputs as (features, batch), thus another reshape is needed)
-#         x -> reshape(x, :, size(x, 2)*size(x, 3)),
-#         # 128×sb
-#         Dense(128 => encoding_dim, relu),
-#         # d×sb
-#         x -> reshape(x, encoding_dim, max_seq_len, batch_size),
-#         # d×s×b
-#         x -> norm_enc(x)
-#     )
-
-#     dropout = Dropout(dropout_prob)
-
-#     mask = basic_causal_mask(max_seq_len)
-#     if no_past_info
-#         mask = input_only_mask(max_seq_len)
-#     end
-
-#     pos_enc = positional_encoding(max_seq_len, encoding_dim)
-
-#     trunk = Array{PolicyTransformerLayer}(undef, num_trunk_layers)
-#     for i_trunk_layer in 1:num_trunk_layers
-#         trunk[i_trunk_layer] = PolicyTransformerLayer(encoding_dim, init=init, dropout_prob=dropout_prob)
-#     end
-
-#     action_head = Dense(encoding_dim => 5; bias=true, init=init)
-#     nsteps_head = Dense(encoding_dim => 7; bias=true, init=init)
-
-#     return TransformerPolicy(
-#         batch_size, max_seq_len, encoding_dim,
-#         encoder, pos_enc, dropout, mask, trunk, action_head, nsteps_head)
-# end
-
-# function (m::TransformerPolicy)(input::AbstractArray{Float32, 5}) # [8 × 8 × 5 × ntokens × batch_size]
-
-#     X = m.encoder(input) .+ m.pos_enc
-#     X = m.dropout(X)
-
-#     for layer in m.trunk
-#         X = layer(X, m.mask)
-#     end
-
-#     action_logits = m.action_head(X) # [5 × ntokens × batch_size]
-#     nsteps_logits = m.nsteps_head(X) # [7 × ntokens × batch_size]
-
-#     return (action_logits, nsteps_logits)
-# end
-
-# struct TransformerPolicyData
-#     inputs::AbstractArray{Float32} # 8 × 8 × 5 × max_seq_len × batch_size
-#     policy_target::AbstractArray{Float32}  # 5 × max_seq_len × batch_size
-#     nsteps_target::AbstractArray{Float32}  # 7 × max_seq_len × batch_size
-#     policy_mask::AbstractArray{Int32}      # 5 × max_seq_len × batch_size
-#     nsteps_mask::AbstractArray{Int32}      # 7 × max_seq_len × batch_size
-# end
-
-# function TransformerPolicyData(m::TransformerPolicy)
-#     inputs = zeros(Float32, (8, 8, 5, m.max_seq_len, m.batch_size))
-#     policy_target = zeros(Float32, (5, m.max_seq_len, m.batch_size))
-#     nsteps_target = zeros(Float32, (7, m.max_seq_len, m.batch_size))
-#     policy_mask = zeros(Int32, size(policy_target))
-#     nsteps_mask = zeros(Int32, size(nsteps_target))
-#     return TransformerPolicyData(inputs, policy_target, nsteps_target, policy_mask, nsteps_mask)
-# end
-
-# function to_gpu(tpd::TransformerPolicyData)
-#     return TransformerPolicyData(
-#         gpu(tpd.inputs),
-#         gpu(tpd.policy_target),
-#         gpu(tpd.nsteps_target),
-#         gpu(tpd.policy_mask),
-#         gpu(tpd.nsteps_mask)
-#     )
-# end
-
-# function to_cpu(tpd::TransformerPolicyData)
-#     return TransformerPolicyData(
-#         cpu(tpd.inputs),
-#         cpu(tpd.policy_target),
-#         cpu(tpd.nsteps_target),
-#         cpu(tpd.policy_mask),
-#         cpu(tpd.nsteps_mask)
-#     )
-# end
+    A = m.affine1(A)
+    A = relu(A)
+    return m.affine2(A)
+end
 
 
 # --------------------------------------------------------------------------
+struct BoardEncoder
+    conv1::Conv
+    conv2::Conv
+    conv3::Conv
+    dense::Dense
+    layernorm::Flux.LayerNorm
+end
+
+Flux.@functor BoardEncoder
+
+function BoardEncoder(encoding_dim::Int)
+    e = encoding_dim
+
+    conv1 = Conv((5,5), 5=>8, relu, stride=1, pad=2)
+    conv2 = Conv((5,5), 8=>8, relu, stride=1, pad=2)
+    conv3 = Conv((5,5), 8=>2, relu, stride=1, pad=2)
+    dense = Dense(128 => e, relu)
+    layernorm = Flux.LayerNorm(e)
+    return BoardEncoder(conv1, conv2, conv3, dense, layernorm)
+end
+
+function (m::BoardEncoder)(X::AbstractArray{Float32}) # [8×5×5×...]
+    orig_size = size(X)
+
+    # 8×8×5×s×b
+    # Combine the trailing dimensions into the batch dimension
+    X = reshape(X, orig_size[1], orig_size[2], orig_size[3], :)
+    # 8×8×5×sb
+    X = m.conv1(X)
+    # 8×8×8×sb
+    X = m.conv2(X)
+    # 8×8×8×sb
+    X = m.conv3(X)
+    # 8×8×2×sb
+    X = reshape(Flux.flatten(X), 128, :)
+    # 128×sb
+    X = m.dense(X)
+    # e×sb
+    X = reshape(X, size(X)[1], orig_size[4:end]...),
+    # e×s×b
+    return m.layernorm(X)
+end
+
+# --------------------------------------------------------------------------
+
+struct SokobanPolicyLevel1
+    batch_size::Int   # batch size
+    max_seq_len::Int  # maximum input length, in number of tokens
+    encoding_dim::Int # dimension of the embedding space
+    n_actions::Int    # number of actions that this outputs
+
+    encoder::BoardEncoder
+    pos_enc::AbstractMatrix{Float32}
+    dropout::Dropout
+    mask::AbstractMatrix{Bool} # causal mask, [s × s], mask[i,j] means input j attends to input i
+    trunk::Vector{PolicyTransformerLayer}
+
+    action_head::Dense # produces n_actions logits
+    nsteps_head::Dense # P(min(round(log(n+1)), 5)) plus inf, produces logits
+    goalem_head::GoalEmbeddingHead # produces n_actions goal embeddings
+end
+
+Flux.@functor SokobanPolicyLevel1
+
+function SokobanPolicyLevel1(;
+        batch_size::Int = 32,
+        max_seq_len::Int = 32,
+        encoding_dim::Int = 8,
+        n_actions::Int = 4,
+        num_trunk_layers::Int = 3,
+        n_mha_heads::Int = 8,
+        trunk_hidden_dim_scale::Int = 4,
+        action_hidden_dim_scale::Int = 2,
+        encoder_conv_dim::Int = 8,
+        init = Flux.glorot_uniform,
+        dropout_prob::Float64 = 0.0,
+        )
+
+    e = encoding_dim
+    f = encoder_conv_dim
+    a = n_actions
+    b = batch_size
+    s = max_seq_len
+
+    dropout = Dropout(dropout_prob)
+    pos_enc = positional_encoding(s, e)
+    mask = basic_causal_mask(s)
+
+    encoder = BoardEncoder(e)
+
+    # The trunk is the workhorse of the transformer, and iteratively
+    # applies self-attention and skip-connection nonlinearities
+    trunk = Array{PolicyTransformerLayer}(undef, num_trunk_layers)
+    for i_trunk_layer in 1:num_trunk_layers
+        trunk[i_trunk_layer] = PolicyTransformerLayer(
+            e, init=init, dropout_prob=dropout_prob,
+            nheads=n_mha_heads, hidden_dim_scale=trunk_hidden_dim_scale)
+    end
+
+    goalem_hidden_dim = e*action_hidden_dim_scale
+
+    action_head = Dense(e => a; bias=true, init=init)
+    nsteps_head = Dense(e => 7; bias=true, init=init)
+    goalem_head = GoalEmbeddingHead(e, a, action_hidden_dim_scale, bias=true, init=init)
+
+    return SokobanPolicyLevel1(
+        batch_size, max_seq_len, encoding_dim, n_actions,
+        encoder, pos_enc, dropout, mask, trunk, action_head, nsteps_head, goalem_head)
+end
+
+function (m::SokobanPolicyLevel1)(input::AbstractArray{Float32, 5}) # [8×8×5×s×b]
+
+    X = m.encoder(input) .+ m.pos_enc
+    X = m.dropout(X)
+
+    for layer in m.trunk
+        X = layer(X, m.mask)
+    end
+
+    action_logits   = m.action_head(X) # [  a×s×b]
+    nsteps_logits   = m.nsteps_head(X) # [  7×s×b]
+    goal_embeddings = m.goalem_head(X) # [e×a×s×b]
+
+    return (action_logits, nsteps_logits, goal_embeddings)
+end
+
+struct SokobanPolicyLevel1Data
+    inputs::AbstractArray{Float32} # 8 × 8 × 5 × s × b
+    policy_target::AbstractArray{Float32}  # e × s × b
+    nsteps_target::AbstractArray{Float32}  # 7 × s × b
+    policy_mask::AbstractArray{Int32}      # a × s × b
+    nsteps_mask::AbstractArray{Int32}      # 7 × s × b
+end
+
+function SokobanPolicyLevel1Data(max_seq_len::Int, batch_size::Int, encoding_dim::Int, n_actions::Int)
+    s, b, e, a = max_seq_len, batch_size, encoding_dim, n_actions
+
+    inputs = zeros(Float32, (8, 8, 5, s,  b))
+    policy_target = zeros(Float32, (e, s, b))
+    nsteps_target = zeros(Float32, (7, s, b))
+    policy_mask = zeros(Int32, (a, s, b))
+    nsteps_mask = zeros(Int32, (7, s, b))
+    return SokobanPolicyLevel1Data(inputs, policy_target, nsteps_target, policy_mask, nsteps_mask)
+end
+
+function SokobanPolicyLevel1Data(m::SokobanPolicyLevel1)
+    return SokobanPolicyLevel1Data(m.max_seq_len, m.batch_size, m.encoding_dim, m.n_actions)
+end
+
+function to_gpu(tpd::SokobanPolicyLevel1Data)
+    return SokobanPolicyLevel1Data(
+        gpu(tpd.inputs),
+        gpu(tpd.policy_target),
+        gpu(tpd.nsteps_target),
+        gpu(tpd.policy_mask),
+        gpu(tpd.nsteps_mask)
+    )
+end
+
+function to_cpu(tpd::SokobanPolicyLevel1Data)
+    return SokobanPolicyLevel1Data(
+        cpu(tpd.inputs),
+        cpu(tpd.policy_target),
+        cpu(tpd.nsteps_target),
+        cpu(tpd.policy_mask),
+        cpu(tpd.nsteps_mask)
+    )
+end
+
+
+# --------------------------------------------------------------------------
+
+# # Unpack a TrainingEntry1 into the tensor representation used by the model.
+function convert_training_entry!(
+        inputs::Array{Float32},    # 8×8×5×s×b
+        policy_target::Array{Float32}, # e×s×b
+        nsteps_target::Array{Float32}, # 7×s×b
+        policy_mask::Array{Int32},     # a×s×b
+        nsteps_mask::Array{Int32},     # 7×s×b
+        training_entry::TrainingEntry1,
+        encoder::BoardEncoder,
+        batch_index::Int)
+
+    # Ensure that our training entry is not longer than our model can handle
+    n_states = length(training_entry.states)
+    @assert n_states < size(inputs, 4)
+
+    b = batch_index
+
+    # Only train on things we set to 1
+    policy_mask[:, :, b] .= 0
+    nsteps_mask[:, :, b] .= 0
+
+    # The overall goal is the final state (sans player),
+    # Or the one goal if it exists.
+    goal_board = deepcopy(length(training_entry.states) > 0 ? training_entry.states[end] : training_entry.goals[end])
+    remove_player!(goal_board)
+
+    # The goal always goes into the first entry
+    set_board_input!(inputs, goal_board, 1, b)
+    policy_target[:, 1, b] .= 1.0/size(policy_target, 1)
+    nsteps_target[:, 1, b] .= 1.0/size(nsteps_target, 1)
+
+    # Walk through the game and place the states
+    input_states = Board[]
+    push!(input_states, training_entry.s_start)
+    for s in 1:(length(training_entry.states)-1)
+        push!(input_states, training_entry.states[s])
+    end
+
+    goal_inputs = Array{Float32}(undef, 8, 8, 5, 1, 1)
+
+    s = 2 # seq index
+    for (board, goal) in zip(input_states, training_entry.goals)
+
+        set_board_input!(inputs, board, s, b)
+        set_board_input!(goal_inputs, goal, 1, 1)
+        policy_target[:, s, b] = encoder(goal_inputs)[:,:,:,1,1]
+
+        nsteps_target[:, s, b] .= Float32(0)
+        nsteps_remaining = length(training_entry.moves) + 1 - s
+        idx = Int(clamp(round(log(nsteps_remaining+1)), 0, 5)) + 1
+        nsteps_target[idx, s, b] = Float32(1)
+
+        policy_mask[:, s, b] .= 1 # train on the action
+        nsteps_mask[:, s, b] .= 1 # train on the step count
+
+        s += 1
+    end
+
+    # Always set the final state (which is the first state in an unsolved entry),
+    # but the policy target is not trained on.
+    set_board_input!(inputs, state.board, s, b)
+    policy_target[:, s, b] .= 1.0/size(policy_target, 1)
+    nsteps_target[:, s, b] .= Float32(0)
+    nsteps_mask[:, s, b] .= 1
+    if n_moves > 0
+        nsteps_target[1, s, b] = Float32(1) # solved.
+    else
+        nsteps_target[end, s, b] = Float32(1) # infinite steps to solve w/out undo
+    end
+end
+
+function convert_training_entry!(
+        data::SokobanPolicyLevel1Data,
+        training_entry::TrainingEntry1,
+        encoder::BoardEncoder,
+        batch_index::Int)
+    convert_training_entry!(
+        data.inputs,
+        data.policy_target,
+        data.nsteps_target,
+        data.policy_mask,
+        data.nsteps_mask,
+        training_entry,
+        encoder,
+        batch_index)
+    return data
+end
+
+# function clear!(data::SokobanPolicyLevel0Data, batch_index::Int)
+#     data.inputs[:, :, :, :, batch_index] .= 0
+#     data.policy_mask[:, :, batch_index] .= 0 # don't train on it
+#     data.nsteps_mask[:, :, batch_index] .= 0 # don't train on it
+#     data.policy_target[:, :, batch_index] .= 1.0/size(data.policy_target, 1)
+#     data.nsteps_target[:, :, batch_index] .= 1.0/size(data.nsteps_target, 1)
+#     return data
+# end
