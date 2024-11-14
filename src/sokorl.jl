@@ -53,28 +53,8 @@ function calc_gradient_l2_norm(v::Any)
     return sqrt(calc_gradient_l2_norm_helper(v))
 end
 
-function calc_num_params(item)::Int
-    if item isa NamedTuple
-        sum = 0
-        for val in values(item)
-            sum += calc_num_params(val)
-        end
-        return sum
-    elseif item isa Tuple || item isa Vector
-        sum = 0
-        for entry in item
-            sum += calc_num_params(entry)
-        end
-        return sum
-    elseif item isa AbstractArray{Float32}
-        return length(item)
-    elseif item === nothing
-        return 0
-    elseif item isa Real
-        return 1
-    else
-        error("Unsupported type encountered: $(typeof(item))")
-    end
+function calc_num_params(model)
+    return sum(length, Flux.params(model))
 end
 
 
@@ -552,6 +532,108 @@ function construct_failed_training_entry2(game::Game, rng = Random.default_rng()
     )
 end
 
+
+"""
+Identify the box that moved between states s0 and s1.
+Returns the tile index of the box in s0 and s1.
+Returns `nothing` of no boxes or more than 1 box moved.
+"""
+function find_moved_box(A::Board, B::Board)::Union{Nothing, Pair{TileIndex,TileIndex}}
+    moved_boxes_a = TileIndex[]
+    for (□, v) in enumerate(A)
+        if (v & BOX) > 0 && (B[□] & BOX) == 0
+            # This is a box in A that is not in the same place in B
+            push!(moved_boxes_a, □)
+        end
+    end
+    if length(moved_boxes_a) != 1
+        return nothing
+    end
+
+    moved_boxes_b = TileIndex[]
+    for (□, v) in enumerate(B)
+        if (v & BOX) > 0 && (A[□] & BOX) == 0
+            # This is a box in B that is not in the same place in A
+            push!(moved_boxes_b, □)
+        end
+    end
+    if length(moved_boxes_b) != 1
+        return nothing
+    end
+
+    return (moved_boxes_a[1] => moved_boxes_b[1])
+end
+
+"""
+Construct a TrainingEntry0 based on a 1-box transition from A to B.
+Training examples are the steps for which we have a moved box.
+The goal is the transformed problem (replacing other boxes with walls, only goal is the box pos),
+And the states are the real states.
+"""
+function build_level0_board_for_transition(
+        board::Board,
+        □_box_src::TileIndex,
+        □_box_dst::TileIndex,
+        remove_player::Bool)::Board
+    retval = deepcopy(board)
+
+    # replace all boxes except the target box with walls
+    for (□, v) in enumerate(retval)
+        if (v & BOX) > 0 && □ != □_box_src
+            retval[□] &= ~BOX
+            retval[□] |= WALL
+        end
+    end
+
+    # remove all goals
+    for □ in tile_indices(retval)
+        retval[□] &= ~GOAL
+    end
+
+    # place a goal at the final box position
+    retval[□_box_dst] |= GOAL
+
+    if remove_player
+        remove_player!(retval)
+    end
+
+    return retval
+end
+
+function construct_solved_training_entry_from_transition(A::Board, B::Board)::Union{Nothing, TrainingEntry0}
+
+    # Ensure that we have one moved box
+    box_pair = find_moved_box(A, B)
+    if isnothing(box_pair)
+        return nothing
+    end
+
+    # Build our simplified problem
+    board_src = build_level0_board_for_transition(A, box_pair[1], box_pair[2], false)
+    board_dst = build_level0_board_for_transition(B, box_pair[2], box_pair[2], true)
+
+    # Solve the problem
+    solver = AStar(
+        100,
+        1.0,
+        5000000
+    )
+    subgame = Game(board_src)
+    solve_data = solve(solver, subgame)
+    if !solve_data.solved
+        return nothing
+    end
+
+    state = State(subgame, subgame.board_start)
+    moves = convert_to_moves(subgame, state, solve_data.pushes[1:solve_data.sol_depth])
+    n_moves = length(moves)
+
+    return TrainingEntry0(
+        board_src,
+        board_dst,
+        moves,
+    )
+end
 
 
 # --------------------------------------------------------------------------
