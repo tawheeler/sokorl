@@ -932,13 +932,58 @@ end
 
 # --------------------------------------------------------------------------
 
+struct BoardEncoder
+    conv1::Conv
+    conv2::Conv
+    conv3::Conv
+    dense::Dense
+    layernorm::Flux.LayerNorm
+end
+
+Flux.@functor BoardEncoder
+
+function BoardEncoder(encoding_dim::Int)
+    e = encoding_dim
+
+    conv1 = Conv((5,5), 5=>8, relu, stride=1, pad=2)
+    conv2 = Conv((5,5), 8=>8, relu, stride=1, pad=2)
+    conv3 = Conv((5,5), 8=>2, relu, stride=1, pad=2)
+    dense = Dense(128 => e, relu)
+    layernorm = Flux.LayerNorm(e)
+    return BoardEncoder(conv1, conv2, conv3, dense, layernorm)
+end
+
+function (m::BoardEncoder)(X::AbstractArray{Float32}) # [8×5×5×...]
+    orig_size = size(X)
+
+    # 8×8×5×s×b
+    # Combine the trailing dimensions into the batch dimension
+    X = reshape(X, orig_size[1], orig_size[2], orig_size[3], :)
+    # 8×8×5×sb
+    X = m.conv1(X)
+    # 8×8×8×sb
+    X = m.conv2(X)
+    # 8×8×8×sb
+    X = m.conv3(X)
+    # 8×8×2×sb
+    X = reshape(Flux.flatten(X), 128, :)
+    # 128×sb
+    X = m.dense(X)
+    # e×sb
+    X = reshape(X, size(X)[1], orig_size[4:end]...)
+    # e×s×b
+    return m.layernorm(X)
+end
+
+# --------------------------------------------------------------------------
+
 # The Level-0 Policy
 struct SokobanPolicyLevel0
     batch_size::Int   # b, batch size
     max_seq_len::Int  # s, maximum input length, in number of tokens
     encoding_dim::Int # e, dimension of the embedding space
 
-    encoder::Chain
+    encoder::BoardEncoder
     pos_enc::AbstractMatrix{Float32}
     dropout::Dropout
     mask::AbstractMatrix{Bool} # causal mask, [s × s], mask[i,j] means input j attends to input i
@@ -967,32 +1012,12 @@ function SokobanPolicyLevel0(;
     b = batch_size
     s = max_seq_len
 
-    norm_enc = Flux.LayerNorm(e)
+    # The encoder encodes the states into token embeddings (8×8×5×s×b →  e×s×b)
+    encoder = BoardEncoder(e)
+
     dropout = Dropout(dropout_prob)
     pos_enc = positional_encoding(s, e)
     mask = no_past_info ? input_only_mask(s) : basic_causal_mask(s)
-
-    # The encoder encodes the states into token embeddings (8×8×5×s×b →  e×s×b)
-    encoder = Chain(
-        # 8×8×5×s×b
-        x -> reshape(x, size(x)[1], size(x)[2], size(x)[3], size(x)[4]*size(x)[5]),
-        # 8×8×5×sb
-        Conv((5,5), 5=>f, relu, stride=1, pad=2),
-        # 8×8×f×sb
-        Conv((5,5), f=>f, relu, stride=1, pad=2),
-        # 8×8×f×sb
-        Conv((5,5), f=>2, relu, stride=1, pad=2),
-        # 8×8×2×sb
-        x -> reshape(Flux.flatten(x), 128, s, b),
-        # 128×s×b (Dense layer expects inputs as (features, batch), thus another reshape is needed)
-        x -> reshape(x, :, size(x, 2)*size(x, 3)),
-        # 128×sb
-        Dense(128 => e, relu),
-        # e×sb
-        x -> reshape(x, e, s, b),
-        # e×s×b
-        x -> norm_enc(x)
-    )
 
     # The trunk is the workhorse of the transformer, and iteratively
     # applies self-attention and skip-connection nonlinearities
@@ -1673,51 +1698,6 @@ function (m::GoalEmbeddingHead)(X::AbstractArray{Float32, 3}) # [e×s×b]
     return m.affine2(A)
 end
 
-
-# --------------------------------------------------------------------------
-struct BoardEncoder
-    conv1::Conv
-    conv2::Conv
-    conv3::Conv
-    dense::Dense
-    layernorm::Flux.LayerNorm
-end
-
-Flux.@functor BoardEncoder
-
-function BoardEncoder(encoding_dim::Int)
-    e = encoding_dim
-
-    conv1 = Conv((5,5), 5=>8, relu, stride=1, pad=2)
-    conv2 = Conv((5,5), 8=>8, relu, stride=1, pad=2)
-    conv3 = Conv((5,5), 8=>2, relu, stride=1, pad=2)
-    dense = Dense(128 => e, relu)
-    layernorm = Flux.LayerNorm(e)
-    return BoardEncoder(conv1, conv2, conv3, dense, layernorm)
-end
-
-function (m::BoardEncoder)(X::AbstractArray{Float32}) # [8×5×5×...]
-    orig_size = size(X)
-
-    # 8×8×5×s×b
-    # Combine the trailing dimensions into the batch dimension
-    X = reshape(X, orig_size[1], orig_size[2], orig_size[3], :)
-    # 8×8×5×sb
-    X = m.conv1(X)
-    # 8×8×8×sb
-    X = m.conv2(X)
-    # 8×8×8×sb
-    X = m.conv3(X)
-    # 8×8×2×sb
-    X = reshape(Flux.flatten(X), 128, :)
-    # 128×sb
-    X = m.dense(X)
-    # e×sb
-    X = reshape(X, size(X)[1], orig_size[4:end]...),
-    # e×s×b
-    return m.layernorm(X)
-end
-
 # --------------------------------------------------------------------------
 
 struct SokobanPolicyLevel1
@@ -1803,7 +1783,7 @@ end
 
 struct SokobanPolicyLevel1Data
     inputs::AbstractArray{Float32} # 8 × 8 × 5 × s × b
-    policy_target::AbstractArray{Float32}  # e × s × b
+    policy_target::AbstractArray{Float32}  # e × s × b (embeddings)
     nsteps_target::AbstractArray{Float32}  # 7 × s × b
     policy_mask::AbstractArray{Int32}      # a × s × b
     nsteps_mask::AbstractArray{Int32}      # 7 × s × b
@@ -1935,11 +1915,13 @@ function convert_training_entry!(
     return data
 end
 
-# function clear!(data::SokobanPolicyLevel0Data, batch_index::Int)
-#     data.inputs[:, :, :, :, batch_index] .= 0
-#     data.policy_mask[:, :, batch_index] .= 0 # don't train on it
-#     data.nsteps_mask[:, :, batch_index] .= 0 # don't train on it
-#     data.policy_target[:, :, batch_index] .= 1.0/size(data.policy_target, 1)
-#     data.nsteps_target[:, :, batch_index] .= 1.0/size(data.nsteps_target, 1)
-#     return data
-# end
+function clear!(data::SokobanPolicyLevel1Data, batch_index::Int)
+    data.inputs[:, :, :, :, batch_index] .= 0
+    data.policy_mask[:, :, batch_index] .= 0 # don't train on it
+    data.nsteps_mask[:, :, batch_index] .= 0 # don't train on it
+    data.policy_target[:, :, batch_index] .= 0.0 # empty embedding
+    data.nsteps_target[:, :, batch_index] .= 1.0/size(data.nsteps_target, 1)
+    return data
+end
+
+# --------------------------------------------------------------------------
