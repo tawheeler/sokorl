@@ -83,6 +83,10 @@ struct TrainingEntry0
     moves::Vector{Direction}
 end
 
+function has_solution(entry::TrainingEntry0)::Bool
+    return length(entry.moves) > 0
+end
+
 function to_text(entry::TrainingEntry0)::String
     fout = IOBuffer()
 
@@ -228,9 +232,9 @@ function construct_solved_training_entry(game::Game, solve_data::AStarData)
     )
 end
 
-function construct_failed_training_entry(game::Game)
-    # Construct the goal, which has the boxes on the goals
-    goal_board = deepcopy(game.board_start)
+# Place all boxes on goals and remove the player.
+function construct_naive_goal_board(board::Board)
+    goal_board = board
     for (□, v) in enumerate(goal_board)
         if (v & BOX) > 0
             # remove the box from this tile
@@ -240,10 +244,17 @@ function construct_failed_training_entry(game::Game)
             # add a box on this tile
             goal_board[□] |= BOX
         end
+        if (v & PLAYER) > 0
+            # remove the player
+            goal_board[□] &= ~PLAYER
+        end
     end
+    return goal_board
+end
 
-    # Remove the player from the goal board
-    goal_board[game.□_player_start] &= ~PLAYER
+function construct_failed_training_entry(game::Game)
+    # Construct the goal, which has the boxes on the goals and no player.
+    goal_board = construct_naive_goal_board(game.board_start)
 
     return TrainingEntry0(
         deepcopy(game.board_start), # s_start
@@ -1051,6 +1062,7 @@ function (m::SokobanPolicyLevel0)(input::AbstractArray{Float32, 5}) # [8×8×5×
     return (action_logits, nsteps_logits)
 end
 
+# TODO: Could most of these be UInt8 since they are sparse?
 struct SokobanPolicyLevel0Data
     inputs::AbstractArray{Float32}     # 8×8×5×s×b
     policy_target::AbstractArray{Float32}  # 4×s×b
@@ -1241,15 +1253,16 @@ function beam_search!(
         policy::SokobanPolicyLevel0
     )
 
-    inputs = data.inputs
+    policy = gpu(policy)
+    inputs = cpu(data.inputs)
     moves = data.moves
     scores = data.scores
 
     b = size(inputs, 5) # The beam width is equal to the batch size
     @assert b == size(moves, 2)
 
-    max_seq_len = size(inputs, 4)
-    @assert max_seq_len == size(moves, 1)
+    s = size(inputs, 4)
+    @assert s == size(moves, 1)
 
     # We're going to track a batch worth of states in our beam
     game = Game(deepcopy(s_start))
@@ -1262,7 +1275,7 @@ function beam_search!(
 
     inputs_next = zeros(Float32, size(inputs))
     states_next = Array{State}(undef, b)
-    moves_next = zeros(Direction, (policy.max_seq_len, policy.batch_size))
+    moves_next = zeros(Direction, (s, b))
 
     # The array of beam scores, which has one value per action, per beam.
     scores_next = Array{Float32}(undef, 5*b)
@@ -1274,27 +1287,27 @@ function beam_search!(
     end
 
     # Advance the games in parallel
-    for seq_index in 2:max_seq_len
+    for seq_index in 2:s
 
         for beam_index in 1:n_beams
             set_board_input!(inputs, states[beam_index].board, seq_index, beam_index)
         end
 
         # Run the model
-        # policy_logits are [5 × ntokens × batch_size]
+        # policy_logits are [4 × ntokens × batch_size]
         # nsteps_logits are [7 × ntokens × batch_size]
-        policy_logits_gpu, nsteps_logits_gpu = policy(inputs |> gpu)
+        policy_logits_gpu, nsteps_logits_gpu = policy(gpu(inputs))
 
         # Compute the probabilities
-        probabilities = softmax(policy_logits_gpu, dims=1) |> cpu # [5 × ntokens × batch_size]
+        probabilities = softmax(policy_logits_gpu, dims=1) |> cpu # [4 × ntokens × batch_size]
 
         # Compute the score for each beam.
         # An invalid / unused beam gets a score of -Inf.
         fill!(scores_next, -Inf)
-        for i in 1:5
+        for i in 1:size(probabilities, 1)
             for j in 1:n_beams
                 k = b*(i-1) + j
-                scores_next[k] = scores[j] + probabilities[i,seq_index,j]
+                scores_next[k] = scores[j] + log(probabilities[i,seq_index,j])
             end
         end
 
@@ -1326,20 +1339,8 @@ function beam_search!(
             moves_next[1:seq_index-2,beam_index_dst] = moves[1:seq_index-2,beam_index_src]
             moves_next[seq_index-1,beam_index_dst] = dir
 
-            if dir != DIR_UNDO
-                # Set the next state to the current state.
-                maybe_move!(states_next[beam_index_dst], game, dir)
-
-            elseif seq_index > 2 # can only undo if we've made a move
-                # Revert to the previous state
-                set_board_from_input!(
-                    states_next[beam_index_dst].board,
-                    inputs,
-                    seq_index-1, # previous seq index
-                    beam_index_src)
-                states_next[beam_index_dst] = State(game, states_next[beam_index_dst].board)
-
-            end
+            # Set the next state to the current state.
+            maybe_move!(states_next[beam_index_dst], game, dir)
 
             # Copy the score
             scores[beam_index_dst] = scores_next[permutation_index]
@@ -1386,22 +1387,25 @@ function rollout!(
     policy::SokobanPolicyLevel0,
     s_starts::Vector{Board}, # [b] the starting boards
     s_goals::Vector{Board};  # [b] the goal boards
-    policy_dirichlet_prior::Float32 = 1.0f0,
+    policy_dirichlet_prior::Float32 = 0.0f0,
     reward_bad_move::Float32 = -0.1f0, # reward obtained for a step that runs into a wall
     reward_solve::Float32    =  1.0f0, # reward obtained for solving a puzzle
     )
 
-    inputs = data.inputs
+    policy = gpu(policy)
+    inputs_cpu = data.inputs
     moves = data.moves
     rewards = data.rewards
     depths = data.depths
 
-    s = size(inputs, 4)
-    b = size(inputs, 5)
+    gumbel = Gumbel(0, 1)
+
+    s = size(inputs_cpu, 4)
+    b = size(inputs_cpu, 5)
 
     @assert length(s_starts) == b
     @assert length(s_goals) == b
-    @assert size(inputs) == (8, 8, 5, s, b)
+    @assert size(inputs_cpu) == (8, 8, 5, s, b)
     @assert size(moves) == (s,b)
     @assert size(rewards) == (s,b)
     @assert length(depths) == b
@@ -1416,12 +1420,12 @@ function rollout!(
 
     # Fill the goals into the first sequence channel
     for (bi, s_goal) in enumerate(s_goals)
-        set_board_input!(inputs, s_goal, 1, bi)
+        set_board_input!(inputs_cpu, s_goal, 1, bi)
     end
 
     # Fill the start states in the next sequence channel
     for (bi, s_start) in enumerate(s_starts)
-        set_board_input!(inputs, s_start, 2, bi)
+        set_board_input!(inputs_cpu, s_start, 2, bi)
     end
 
     for si in 2:s
@@ -1430,18 +1434,19 @@ function rollout!(
         end
 
         # Run the model
-        # policy_logits are [5 × s × b]
+        # policy_logits are [4 × s × b]
         # nsteps_logits are [7 × s × b]
-        policy_logits, nsteps_logits = policy(inputs)
+        policy_logits_gpu, nsteps_logits_gpu = policy(gpu(inputs_cpu))
 
         # Pull out the logits for our current sequence index.
-        policy_logits_seq = policy_logits[:,si,:] # [5 × b]
+        policy_logits_seq = cpu(policy_logits_gpu)[:,si,:] # [4 × b]
 
         # Optionally bias the policy logits.
-        policy_logits_seq[:,:] .+= policy_dirichlet_prior # [5 × b]
+        policy_logits_seq[:,:] .+= policy_dirichlet_prior # [4 × b]
 
-        # Produce the action probabilities
-        probabilities = softmax(policy_logits_seq, dims=1) # [5 × b]
+        # Sample from the action logits using the Gumbel-max trick
+        gumbel_noise = rand(gumbel, size(policy_logits_seq))
+        sampled_actions = argmax(policy_logits_seq .+ gumbel_noise, dims=1)
 
         # Apply the actions
         for bi in 1:b
@@ -1449,11 +1454,8 @@ function rollout!(
                 continue # no need to simulate this one any further
             end
 
-            # Create a Categorical distribution
-            categorical = Categorical(probabilities[:,bi])
-
-            # Sample from it to get the action
-            ai = rand(categorical)
+            # Grab the sampled action
+            ai = sampled_actions[bi][1]
             dir = Direction(ai)
             moves[si,bi] = dir
 
@@ -1461,26 +1463,18 @@ function rollout!(
             depths[bi] += 1
 
             # Simulate the state forward
-            if dir != DIR_UNDO
-                # Set the next state to the current state.
-                successful_move = maybe_move!(states[bi], dir)
-                rewards[si, bi] += !successful_move * reward_bad_move
+            successful_move = maybe_move!(states[bi], dir)
+            rewards[si, bi] += !successful_move * reward_bad_move
 
-                if is_solved(states[bi])
-                    is_done[bi] = true
-                    num_running -= 1
-                    rewards[si, bi] += reward_solve
-                end
-
-            elseif si > 2 # can only undo if we've made a move
-                # Revert to the previous state
-                set_board_from_input!(states[bi].board, inputs, si-1, bi)
-                states[bi] = State(Game(states[bi].board)) # recompute from the board
+            if is_solved(states[bi])
+                is_done[bi] = true
+                num_running -= 1
+                rewards[si, bi] += reward_solve
             end
 
             # Fill in the next input
             if si < s
-                set_board_input!(inputs, states[bi].board, si+1, bi)
+                set_board_input!(inputs_cpu, states[bi].board, si+1, bi)
             end
         end
     end
@@ -1545,8 +1539,8 @@ function calc_metrics_gpu(
 
             # THIS PART RUNS ON THE CPU
             # Sort predictions. If policy_logits is [7 × s × b] then k_values is also [7 × s × b].
-            # k_valies[1,i,j] will be the index of the top value for the predictions for (i,j)
-            # k_valies[2,i,j] will be the index of the 2nd best value ... etc.
+            # k_values[1,i,j] will be the index of the top value for the predictions for (i,j)
+            # k_values[2,i,j] will be the index of the 2nd best value ... etc.
             policy_logits_cpu = cpu(policy_logits_gpu)
             k_values = mapslices(x -> sortperm(x, rev=true), policy_logits_cpu; dims=1)
 
@@ -1573,8 +1567,8 @@ function calc_metrics_gpu(
 
             # THIS PART RUNS ON THE CPU
             # Sort predictions. If nsteps_logits is [5 × s × b] then k_values is also [5 × s × b].
-            # k_valies[1,i,j] will be the index of the top value for the predictions for (i,j)
-            # k_valies[2,i,j] will be the index of the 2nd best value ... etc.
+            # k_values[1,i,j] will be the index of the top value for the predictions for (i,j)
+            # k_values[2,i,j] will be the index of the 2nd best value ... etc.
             nsteps_logits_cpu = cpu(nsteps_logits_gpu)
             k_values = mapslices(x -> sortperm(x, rev=true), nsteps_logits_cpu; dims=1)
 
@@ -1639,13 +1633,13 @@ function calc_metrics_gpu(
         beam_search!(data, training_entry.s_start, training_entry.s_goal, policy)
 
         if data.solution == -1 # failed
-            if training_entry.solved
+            if has_solution(training_entry)
                 n_failed_fp += 1 # we should not have failed this one
             else
                 n_failed_tp += 1 # we expected not to solve this one
             end
         else
-            if training_entry.solved
+            if has_solution(training_entry)
                 n_solved_tp += 1 # we had a stored solution for this one
             else
                 n_solved_fp += 1 # this one should not be solvable
@@ -1714,7 +1708,8 @@ struct SokobanPolicyLevel1
 
     action_head::Dense # produces n_actions logits
     nsteps_head::Dense # P(min(round(log(n+1)), 5)) plus inf, produces logits
-    goalem_head::GoalEmbeddingHead # produces n_actions goal embeddings
+    goalem_head_μ::GoalEmbeddingHead # produces n_actions goal embeddings
+    goalem_head_logν::GoalEmbeddingHead # the log variance of the goal embedding means
 end
 
 Flux.@functor SokobanPolicyLevel1
@@ -1758,11 +1753,32 @@ function SokobanPolicyLevel1(;
 
     action_head = Dense(e => a; bias=true, init=init)
     nsteps_head = Dense(e => 7; bias=true, init=init)
-    goalem_head = GoalEmbeddingHead(e, a, action_hidden_dim_scale, bias=true, init=init)
+    goalem_head_μ = GoalEmbeddingHead(e, a, action_hidden_dim_scale, bias=true, init=init)
+    goalem_head_logν = GoalEmbeddingHead(e, a, action_hidden_dim_scale, bias=true, init=init)
 
     return SokobanPolicyLevel1(
         batch_size, max_seq_len, encoding_dim, n_actions,
-        encoder, pos_enc, dropout, mask, trunk, action_head, nsteps_head, goalem_head)
+        encoder, pos_enc, dropout, mask, trunk, action_head, nsteps_head, goalem_head_μ, goalem_head_logν)
+end
+
+function load_policy(::Type{SokobanPolicyLevel1}, model_directory::AbstractString, params::Dict{String,Any})
+
+    policy = SokobanPolicyLevel1(
+        batch_size = params["batch_size"],
+        max_seq_len = params["max_seq_len"],
+        encoding_dim = params["encoding_dim"],
+        n_actions = params["n_actions"],
+        num_trunk_layers = params["num_trunk_layers"],
+        n_mha_heads = params["n_mha_heads"],
+        trunk_hidden_dim_scale = params["trunk_hidden_dim_scale"],
+        action_hidden_dim_scale = params["action_hidden_dim_scale"],
+        encoder_conv_dim = params["encoder_conv_dim"],
+        dropout_prob=params["dropout_prob"])
+
+    model_state = JLD2.load(joinpath(model_directory, "model1.jld2"), "model_state");
+    Flux.loadmodel!(policy, model_state);
+
+    return policy
 end
 
 function (m::SokobanPolicyLevel1)(input::AbstractArray{Float32, 5}) # [8×8×5×s×b]
@@ -1776,16 +1792,18 @@ function (m::SokobanPolicyLevel1)(input::AbstractArray{Float32, 5}) # [8×8×5×
 
     action_logits   = m.action_head(X) # [  a×s×b]
     nsteps_logits   = m.nsteps_head(X) # [  7×s×b]
-    goal_embeddings = m.goalem_head(X) # [e×a×s×b]
+    goal_embeddings_μ = m.goalem_head_μ(X) # [e×a×s×b]
+    goal_embeddings_logν = m.goalem_head_logν(X) # [e×a×s×b]
 
-    return (action_logits, nsteps_logits, goal_embeddings)
+    return (action_logits, nsteps_logits, goal_embeddings_μ, goal_embeddings_logν)
 end
 
+# TODO: Could most of these be UInt8 since they are sparse?
 struct SokobanPolicyLevel1Data
     inputs::AbstractArray{Float32} # 8 × 8 × 5 × s × b
     policy_target::AbstractArray{Float32}  # e × s × b (embeddings)
     nsteps_target::AbstractArray{Float32}  # 7 × s × b
-    policy_mask::AbstractArray{Int32}      # a × s × b
+    policy_mask::AbstractArray{Int32}      # 1 × s × b
     nsteps_mask::AbstractArray{Int32}      # 7 × s × b
 end
 
@@ -1795,7 +1813,7 @@ function SokobanPolicyLevel1Data(max_seq_len::Int, batch_size::Int, encoding_dim
     inputs = zeros(Float32, (8, 8, 5, s,  b))
     policy_target = zeros(Float32, (e, s, b))
     nsteps_target = zeros(Float32, (7, s, b))
-    policy_mask = zeros(Int32, (a, s, b))
+    policy_mask = zeros(Int32, (1, s, b))
     nsteps_mask = zeros(Int32, (7, s, b))
     return SokobanPolicyLevel1Data(inputs, policy_target, nsteps_target, policy_mask, nsteps_mask)
 end
@@ -1859,23 +1877,23 @@ function convert_training_entry!(
     nsteps_target[:, 1, b] .= 1.0/size(nsteps_target, 1)
 
     # Walk through the game and place the states
-    input_states = Board[]
-    push!(input_states, training_entry.s_start)
-    for s in 1:(length(training_entry.states)-1)
-        push!(input_states, training_entry.states[s])
-    end
+    all_states = Board[]
+    push!(all_states, training_entry.s_start)
+    append!(all_states, training_entry.states)
 
     goal_inputs = Array{Float32}(undef, 8, 8, 5, 1, 1)
 
     s = 2 # seq index
-    for (board, goal) in zip(input_states, training_entry.goals)
+
+    # Note that all_states is 1 longer than goals, so we end up with an extra state.
+    for (board, goal) in zip(all_states, training_entry.goals)
 
         set_board_input!(inputs, board, s, b)
         set_board_input!(goal_inputs, goal, 1, 1)
         policy_target[:, s, b] = encoder(goal_inputs)[:,:,:,1,1]
 
         nsteps_target[:, s, b] .= Float32(0)
-        nsteps_remaining = length(training_entry.moves) + 1 - s
+        nsteps_remaining = length(training_entry.states) + 1 - s
         idx = Int(clamp(round(log(nsteps_remaining+1)), 0, 5)) + 1
         nsteps_target[idx, s, b] = Float32(1)
 
@@ -1887,11 +1905,11 @@ function convert_training_entry!(
 
     # Always set the final state (which is the first state in an unsolved entry),
     # but the policy target is not trained on.
-    set_board_input!(inputs, state.board, s, b)
-    policy_target[:, s, b] .= 1.0/size(policy_target, 1)
+    set_board_input!(inputs, all_states[end], s, b)
+    policy_target[:, s, b] .= Float32(0)
     nsteps_target[:, s, b] .= Float32(0)
     nsteps_mask[:, s, b] .= 1
-    if n_moves > 0
+    if training_entry.solved
         nsteps_target[1, s, b] = Float32(1) # solved.
     else
         nsteps_target[end, s, b] = Float32(1) # infinite steps to solve w/out undo
@@ -1925,3 +1943,238 @@ function clear!(data::SokobanPolicyLevel1Data, batch_index::Int)
 end
 
 # --------------------------------------------------------------------------
+
+"""
+Gaussian mixture model loss
+
+ ℓ are the mixture logits, of shape   [a×...]
+ μ is the mean prediction, of shape [e×a×...]
+ logν is the diagonal log variance  [e×a×...]
+ y_true is the true data              [e×...]
+ mask                                 [1×...]
+
+This loss assumes diagonal Gaussians. We ignore constant terms and get:
+
+  pdf = exp(-0.5*sum( νᵢ(xᵢ - μᵢ)² )
+
+And then we apply a mixture weight over this and take the log
+"""
+function gmm_loss(
+    ℓ::AbstractArray{Float32},
+    μ::AbstractArray{Float32},
+    logν::AbstractArray{Float32},
+    y_true::AbstractArray{Float32},
+    mask::AbstractArray{Int32},
+    )
+
+    w = softmax(ℓ; dims=1)  # mixing coeffs
+    ν = exp.(logν)  # variances
+
+    # Note that this pdf ignores constant terms
+    y_true = reshape(y_true, size(y_true)[1], 1, size(y_true)[2:end]...) # [e×1×...]
+    Δ = y_true .- μ                                                      # [e×a×...]
+    pdfs = exp.(-0.5f0 .* sum(ν .* (Δ.^2); dims=1))                      # [1×a×...]
+    pdfs = reshape(pdfs, size(ℓ))                                        # [  a×...]
+
+    weigted_pdfs = sum(w .* pdfs; dims=1) # [1×...]
+
+    # negative log likelihood
+    loss = -sum(log.(weigted_pdfs) .* mask)
+
+    return loss
+end
+
+function calc_metrics_gpu(
+    policy::SokobanPolicyLevel1,
+    data::SokobanPolicyLevel1Data,
+    validation_set::Vector{TrainingEntry1},
+    encoder::BoardEncoder,
+    )
+
+    policy = gpu(policy)
+
+    m_validation_set = length(validation_set)
+
+    policy_loss = 0.0
+    nsteps_loss = 0.0
+
+    n_policy_predictions = 0.0
+    top_1_policy_accuracy = 0.0
+    top_2_policy_accuracy = 0.0
+
+    n_nsteps_predictions = 0.0
+    top_1_nsteps_accuracy = 0.0
+    top_2_nsteps_accuracy = 0.0
+    solvability_accuracy = 0.0 # how good we are at predicting when a state is solvable or not
+
+    i_batch = 0
+    i_training_entry = 1
+    while i_training_entry ≤ m_validation_set
+        # Run another batch
+        i_batch += 1
+        n_nonzero_entries = 0
+        for batch_index in 1:policy.batch_size
+            if i_training_entry ≤ m_validation_set
+                convert_training_entry!(data, validation_set[i_training_entry], encoder, batch_index)
+                n_nonzero_entries += 1
+            else
+                clear!(data, batch_index)
+            end
+            i_training_entry += 1
+        end
+
+        inputs_gpu = data.inputs |> gpu
+        policy_target_gpu = data.policy_target |> gpu
+        nsteps_target_gpu = data.nsteps_target |> gpu
+        policy_mask_gpu = data.policy_mask |> gpu
+        nsteps_mask_gpu = data.nsteps_mask |> gpu
+
+        # Run the model
+        ℓ_gpu, nsteps_logits_gpu, μ_gpu, logν_gpu = policy(inputs_gpu)
+
+        # Compute the GMM loss
+        n_policy_targets = Flux.sum(policy_mask_gpu)
+        if n_policy_targets > 0
+            policy_loss += (gmm_loss(ℓ_gpu, μ_gpu, logν_gpu, policy_target_gpu, policy_mask_gpu) / n_policy_targets) * n_nonzero_entries
+
+            # THIS PART RUNS ON THE CPU
+            # Sort μ_gpu embeddings by L2 distance to the target goal embeddings.
+            embedding_dists_gpu = let
+                x = reshape(policy_target_gpu, size(policy_target_gpu)[1], 1, size(policy_target_gpu)[2:end]...) # [e×1×...]
+                Δ = x .- μ_gpu # [e×a×...]
+                dists = sqrt.(sum(x.^2; dims=2)) # [e×...]
+                dropdims(dists; dims=2) # [e×...]
+            end
+            embedding_dists_cpu = cpu(embedding_dists_gpu)
+            ek_values = mapslices(x -> sortperm(x, rev=false), embedding_dists_cpu; dims=1)
+
+            # Then sort the predictions.
+            # If policy_logits is [a×s×b] then k_values is also [a×s×b].
+            # k_values[1,s,b] will be the index of the top value for the predictions for (s,b)
+            # k_values[2,s,b] will be the index of the 2nd best value ... etc.
+            policy_logits_cpu = cpu(ℓ_gpu)
+            k_values = mapslices(x -> sortperm(x, rev=true), policy_logits_cpu; dims=1)
+
+            for s in 2:policy.max_seq_len # skip the first one, since it is the goal
+                for b in 1:policy.batch_size
+                    if data.policy_mask[1,s,b] > 0.9
+                        ek1 = ek_values[1,s,b] # the index of the action whose embedding is closest to the target embedding
+                        k1 = k_values[1,s,b]
+                        k2 = k_values[2,s,b]
+                        iscorrect1 = k1 == ek1
+                        iscorrect2 = k2 == ek1
+                        @assert iscorrect1 + iscorrect2 < 2
+                        top_1_policy_accuracy += iscorrect1
+                        top_2_policy_accuracy += iscorrect1 + iscorrect2
+                        n_policy_predictions += 1
+                    end
+                end
+            end
+        end
+
+        n_nsteps_targets = Flux.sum(nsteps_mask_gpu)
+        if n_nsteps_targets > 0
+            nsteps_loss += Flux.Losses.logitcrossentropy(nsteps_logits_gpu, nsteps_target_gpu,
+                agg = losses -> sum(losses .* nsteps_mask_gpu) / n_nsteps_targets) * n_nonzero_entries
+
+            # THIS PART RUNS ON THE CPU
+            # Sort predictions. If nsteps_logits is [5 × s × b] then k_values is also [5 × s × b].
+            # k_values[1,i,j] will be the index of the top value for the predictions for (i,j)
+            # k_values[2,i,j] will be the index of the 2nd best value ... etc.
+            nsteps_logits_cpu = cpu(nsteps_logits_gpu)
+            k_values = mapslices(x -> sortperm(x, rev=true), nsteps_logits_cpu; dims=1)
+
+            for seq_index in 2:policy.max_seq_len # skip the first one, since its the goal
+                for batch_index in 1:policy.batch_size
+                    k1 = k_values[1,seq_index,batch_index]
+                    k2 = k_values[2,seq_index,batch_index]
+                    if data.nsteps_mask[k1,seq_index,batch_index] > 0.9
+                        iscorrect1 = data.nsteps_target[k1,seq_index,batch_index] > 0.9
+                        iscorrect2 = data.nsteps_target[k2,seq_index,batch_index] > 0.9
+                        @assert iscorrect1 + iscorrect2 < 2
+                        top_1_nsteps_accuracy += iscorrect1
+                        top_2_nsteps_accuracy += iscorrect1 + iscorrect2
+                        n_nsteps_predictions += 1
+
+                        not_solvable = data.nsteps_target[end,seq_index,batch_index] > 0.9
+                        if not_solvable
+                            solvability_accuracy += (k1 == size(data.nsteps_target,1))
+                        else
+                            solvability_accuracy += (k1 != size(data.nsteps_target,1))
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return Dict{String, Float64}(
+        "m_validation_set" => m_validation_set,
+        "n_batches"   => i_batch,
+        "policy_loss" => policy_loss / m_validation_set,
+        "nsteps_loss" => nsteps_loss / m_validation_set,
+        "top_1_policy_accuracy" => top_1_policy_accuracy / n_policy_predictions,
+        "top_2_policy_accuracy" => top_2_policy_accuracy / n_policy_predictions,
+        "n_policy_predictions"  => n_policy_predictions,
+        "top_1_nsteps_accuracy" => top_1_nsteps_accuracy / n_nsteps_predictions,
+        "top_2_nsteps_accuracy" => top_2_nsteps_accuracy / n_nsteps_predictions,
+        "solvability_accuracy"  => solvability_accuracy / n_nsteps_predictions,
+        "n_nsteps_predictions"  => n_nsteps_predictions,
+    )
+end
+
+
+# function rollout(
+#     policy0::SokobanPolicyLevel0,
+#     policy1::SokobanPolicyLevel1,
+#     inputs0_cpu::AbstractArray{Float32}, # 8×8×5×s×b
+#     inputs1_cpu::AbstractArray{Float32}, # 8×8×5×s×b
+#     board::Board)
+
+#     b = policy1.batch_size
+
+#     num_running = b
+#     is_done = falses(b) # keep track of whether each rollout is done
+#     n_steps = zeros(Int, b)
+#     states = [State(Game(board)) for i in 1:b]
+#     gumbel = Gumbel(0, 1)
+
+#     # Construct a goal board where all boxes are on goals.
+#     goal_board = construct_naive_goal_board(board)
+
+#     # Fill the goals into the first sequence channel
+#     for bi in 1:b
+#         set_board_input!(inputs1_cpu, goal_board, 1, bi)
+#     end
+
+#     # Fill the start states in the next sequence channel
+#     for (bi, s_start) in enumerate(s_starts)
+#         set_board_input!(inputs1_cpu, board, 2, bi)
+#     end
+
+#     # Simulate forward
+#     for si in 2:s
+#         if num_running ≤ 0
+#             break
+#         end
+
+#         ℓ_gpu, nsteps_logits_gpu, μ_gpu, logν_gpu = policy1(gpu(inputs1_cpu))
+
+#         # Sample from the actions using the Gumbel-max trick
+#         gumbel_noise = rand(gumbel, size(policy_logits_seq)) |> gpu
+#         sampled_actions = argmax(ℓ_gpu .+ gumbel_noise, dims=1) |> cpu
+
+#         # Apply the selected goal embeddings to the level-0 problem.
+#         for (bi, is_running) in enumerate(is_done)
+#             if !is_running
+#                 continue
+#             end
+
+#             fill!(inputs0_cpu, zero(Float32))
+
+#             # TODO: I need a way to bypass the normal goal input with an embedding.
+#             set_board_input!(inputs0_cpu, goal_board, 1, bi)
+#             set_board_input!(inputs0_cpu, goal_board, 1, bi)
+#         end
+#     end
+# end

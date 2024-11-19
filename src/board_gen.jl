@@ -92,9 +92,6 @@ struct SpeckleWalls <: BoardGenAction
 end
 function apply_board_gen_action!(M::SpeckleWalls, board::Board, rng)
 
-    # Determine how many walls to generate
-    n_walls = rand(M.n_walls_lo:M.n_walls_hi)
-
     # Select random non-wall, non-player, non-box, non-goal tile to be walls.
     candidates = TileIndex[]
     for (□, v) in enumerate(board)
@@ -102,6 +99,10 @@ function apply_board_gen_action!(M::SpeckleWalls, board::Board, rng)
             push!(candidates, □)
         end
     end
+
+    # Determine how many walls to generate
+    n_walls = rand(M.n_walls_lo:M.n_walls_hi)
+    n_walls = min(n_walls, length(candidates))
 
     for □ in sample(rng, candidates, n_walls, replace=false)
         board[□] = WALL
