@@ -149,7 +149,7 @@ function diversify_dataset!(training_entries::Vector)
 end
 
 # Load a training entry .txt file
-function load_training_entry(filename::String)
+function load_training_entry(::Type{TrainingEntry0}, filename::String)
     # Open the file and read the contents
     lines = readlines(filename)
     n_lines = length(lines)
@@ -234,7 +234,7 @@ end
 
 # Place all boxes on goals and remove the player.
 function construct_naive_goal_board(board::Board)
-    goal_board = board
+    goal_board = deepcopy(board)
     for (□, v) in enumerate(goal_board)
         if (v & BOX) > 0
             # remove the box from this tile
@@ -332,7 +332,7 @@ end
 
 # Load a training entry .txt file for higher-order sequences,
 # which will contain one solution example.
-function load_training_entry2(filename::String)
+function load_training_entry(::Type{TrainingEntry1}, filename::String)
     # Open the file and read the contents
     lines = readlines(filename)
     n_lines = length(lines)
@@ -703,35 +703,16 @@ end
 
 
 # Load all of the training entries in a directory and its subdirectories
-function load_training_set(directory::String)
+function load_training_set(T, directory::String)
     entries = TrainingEntry0[]
 
     for content in readdir(directory)
         fullpath = joinpath(directory, content)
         if isdir(fullpath)
-            append!(entries, load_training_set(fullpath))
+            append!(entries, load_training_set(T, fullpath))
         elseif isfile(fullpath)
             if endswith(content, ".txt")
-                push!(entries, load_training_entry(fullpath))
-            end
-        end
-    end
-
-    return entries
-end
-
-
-# Load all of the training entries in a directory and its subdirectories
-function load_training_set2(directory::String)
-    entries = TrainingEntry1[]
-
-    for content in readdir(directory)
-        fullpath = joinpath(directory, content)
-        if isdir(fullpath)
-            append!(entries, load_training_set2(fullpath))
-        elseif isfile(fullpath)
-            if endswith(content, ".txt")
-                push!(entries, load_training_entry2(fullpath))
+                push!(entries, load_training_entry(T, fullpath))
             end
         end
     end
@@ -788,7 +769,7 @@ end
 # --------------------------------------------------------------------------
 
 function set_board_input!(
-        inputs::Array{Float32}, # 8×8×5×s×b
+        inputs::Array{Bool}, # 8×8×5×s×b
         board::Board,
         i_seq::Int,
         i_batch::Int)
@@ -796,11 +777,11 @@ function set_board_input!(
     for row in 1:nrows
         for col in 1:ncols
             v = board[col, row]
-            inputs[col, row, 1, i_seq, i_batch] = Float32((v & BOX) > 0)
-            inputs[col, row, 2, i_seq, i_batch] = Float32((v & FLOOR) > 0)
-            inputs[col, row, 3, i_seq, i_batch] = Float32((v & GOAL) > 0)
-            inputs[col, row, 4, i_seq, i_batch] = Float32((v & PLAYER) > 0)
-            inputs[col, row, 5, i_seq, i_batch] = Float32((v & WALL) > 0)
+            inputs[col, row, 1, i_seq, i_batch] = is_set(v, BOX)
+            inputs[col, row, 2, i_seq, i_batch] = is_set(v, FLOOR)
+            inputs[col, row, 3, i_seq, i_batch] = is_set(v, GOAL)
+            inputs[col, row, 4, i_seq, i_batch] = is_set(v, PLAYER)
+            inputs[col, row, 5, i_seq, i_batch] = is_set(v, WALL)
         end
     end
     return inputs
@@ -808,18 +789,18 @@ end
 
 function set_board_from_input!(
         board::Board,
-        inputs::Array{Float32}, # 8×8×5×s×b
+        inputs::Array{Bool}, # 8×8×5×s×b
         i_seq::Int,
         i_batch::Int)
     ncols, nrows = size(board)
     for row in 1:nrows
         for col in 1:ncols
             board[col, row] =
-                (inputs[col, row, 1, i_seq, i_batch] > 0) * BOX +
-                (inputs[col, row, 2, i_seq, i_batch] > 0) * FLOOR +
-                (inputs[col, row, 3, i_seq, i_batch] > 0) * GOAL +
-                (inputs[col, row, 4, i_seq, i_batch] > 0) * PLAYER +
-                (inputs[col, row, 5, i_seq, i_batch] > 0) * WALL
+                inputs[col, row, 1, i_seq, i_batch] * BOX +
+                inputs[col, row, 2, i_seq, i_batch] * FLOOR +
+                inputs[col, row, 3, i_seq, i_batch] * GOAL +
+                inputs[col, row, 4, i_seq, i_batch] * PLAYER +
+                inputs[col, row, 5, i_seq, i_batch] * WALL
         end
     end
     return board
@@ -964,7 +945,7 @@ function BoardEncoder(encoding_dim::Int)
     return BoardEncoder(conv1, conv2, conv3, dense, layernorm)
 end
 
-function (m::BoardEncoder)(X::AbstractArray{Float32}) # [8×5×5×...]
+function (m::BoardEncoder)(X::AbstractArray{Bool}) # [8×8×5×...]
     orig_size = size(X)
 
     # 8×8×5×s×b
@@ -1047,7 +1028,25 @@ function SokobanPolicyLevel0(;
         encoder, pos_enc, dropout, mask, trunk, action_head, nsteps_head)
 end
 
-function (m::SokobanPolicyLevel0)(input::AbstractArray{Float32, 5}) # [8×8×5×s×b]
+# A call method for when we skip the board encoder
+# TODO: Consolidate?
+function (m::SokobanPolicyLevel0)(input::AbstractArray{Float32, 3}) # [e×s×b]
+
+    X = input .+ m.pos_enc
+    X = m.dropout(X)
+
+    for layer in m.trunk
+        X = layer(X, m.mask)
+    end
+
+    action_logits = m.action_head(X) # [4×s×b]
+    nsteps_logits = m.nsteps_head(X) # [7×s×b]
+
+    return (action_logits, nsteps_logits)
+end
+
+# Call method for when we run the board encoder
+function (m::SokobanPolicyLevel0)(input::AbstractArray{Bool, 5}) # [8×8×5×s×b]
 
     X = m.encoder(input) .+ m.pos_enc
     X = m.dropout(X)
@@ -1062,21 +1061,21 @@ function (m::SokobanPolicyLevel0)(input::AbstractArray{Float32, 5}) # [8×8×5×
     return (action_logits, nsteps_logits)
 end
 
-# TODO: Could most of these be UInt8 since they are sparse?
+
 struct SokobanPolicyLevel0Data
-    inputs::AbstractArray{Float32}     # 8×8×5×s×b
-    policy_target::AbstractArray{Float32}  # 4×s×b
-    nsteps_target::AbstractArray{Float32}  # 7×s×b
-    policy_mask::AbstractArray{Int32}      # 4×s×b # TODO: Switch to UInt8
-    nsteps_mask::AbstractArray{Int32}      # 7×s×b
+    inputs::AbstractArray{Bool}         # 8×8×5×s×b
+    policy_target::AbstractArray{Bool}  # 4×s×b  onehot encoding of target action
+    nsteps_target::AbstractArray{Bool}  # 7×s×b  onehot encoding of target discrete nsteps bin
+    policy_mask::AbstractArray{Bool}    # 4×s×b  whether to train on a given sample
+    nsteps_mask::AbstractArray{Bool}    # 7×s×b  whether to train on a given sample
 end
 
-function SokobanPolicyLevel0Data(max_seq_len::Integer, batch_size::Integer)
-    inputs = zeros(Float32, (8, 8, 5, max_seq_len, batch_size))
-    policy_target = zeros(Float32, (4, max_seq_len, batch_size))
-    nsteps_target = zeros(Float32, (7, max_seq_len, batch_size))
-    policy_mask = zeros(Int32, size(policy_target))
-    nsteps_mask = zeros(Int32, size(nsteps_target))
+function SokobanPolicyLevel0Data(s::Integer, b::Integer)
+    inputs = zeros(Bool, (8, 8, 5, s, b))
+    policy_target = zeros(Bool, (4, s, b))
+    nsteps_target = zeros(Bool, (7, s, b))
+    policy_mask = zeros(Bool, size(policy_target))
+    nsteps_mask = zeros(Bool, size(nsteps_target))
     return SokobanPolicyLevel0Data(inputs, policy_target, nsteps_target, policy_mask, nsteps_mask)
 end
 
@@ -1110,11 +1109,11 @@ end
 
 # Unpack a TrainingEntry0 into the tensor representation used by the model.
 function convert_training_entry!(
-        inputs::Array{Float32},    # 8×8×5×s×b
-        policy_target::Array{Float32}, # 4×s×b
-        nsteps_target::Array{Float32}, # 7×s×b
-        policy_mask::Array{Int32},     # 4×s×b
-        nsteps_mask::Array{Int32},     # 7×s×b
+        inputs::Array{Bool},    # 8×8×5×s×b
+        policy_target::Array{Bool}, # 4×s×b
+        nsteps_target::Array{Bool}, # 7×s×b
+        policy_mask::Array{Bool},   # 4×s×b
+        nsteps_mask::Array{Bool},   # 7×s×b
         training_entry::TrainingEntry0,
         batch_index::Int)
 
@@ -1122,53 +1121,53 @@ function convert_training_entry!(
     n_moves = length(training_entry.moves)
     @assert n_moves < size(inputs, 4)
 
-    b = batch_index
+    bi = batch_index
 
     # Only train on things we set to 1
-    policy_mask[:, :, b] .= 0
-    nsteps_mask[:, :, b] .= 0
+    policy_mask[:, :, bi] .= 0
+    nsteps_mask[:, :, bi] .= 0
 
     # The goal always goes into the first entry
-    set_board_input!(inputs, training_entry.s_goal, 1, b)
-    policy_target[:, 1, b] .= 1.0/size(policy_target, 1)
-    nsteps_target[:, 1, b] .= 1.0/size(nsteps_target, 1)
+    set_board_input!(inputs, training_entry.s_goal, 1, bi)
+    policy_target[:, 1, bi] .= true
+    nsteps_target[:, 1, bi] .= true
 
     # Walk through the game and place the states
     game = Game(deepcopy(training_entry.s_start))
     state = State(game, game.board_start)
 
-    s = 2 # seq index
+    si = 2 # seq index
     for dir in training_entry.moves
 
-        set_board_input!(inputs, state.board, s, b)
-        policy_target[:, s, b] .= Float32(0)
-        policy_target[dir, s, b] = Float32(1)
+        set_board_input!(inputs, state.board, si, bi)
+        policy_target[:, si, bi] .= false
+        policy_target[dir, si, bi] = true
 
 
-        nsteps_target[:, s, b] .= Float32(0)
-        nsteps_remaining = length(training_entry.moves) + 1 - s
+        nsteps_target[:, si, bi] .= false
+        nsteps_remaining = length(training_entry.moves) + 1 - si
         idx = Int(clamp(round(log(nsteps_remaining+1)), 0, 5)) + 1
-        nsteps_target[idx, s, b] = Float32(1)
+        nsteps_target[idx, si, bi] = true
 
-        policy_mask[:, s, b] .= 1 # train on the action
-        nsteps_mask[:, s, b] .= 1 # train on the step count
+        policy_mask[:, si, bi] .= true # train on the action
+        nsteps_mask[:, si, bi] .= true # train on the step count
 
         # Advance the state
         succeeded = maybe_move!(state, game, dir)
         @assert succeeded # we expect valid moves in all training examples
-        s += 1
+        si += 1
     end
 
     # Always set the final state (which is the first state in an unsolved entry),
     # but the policy target is not trained on.
-    set_board_input!(inputs, state.board, s, b)
-    policy_target[:, s, b] .= 1.0/size(policy_target, 1)
-    nsteps_target[:, s, b] .= Float32(0)
-    nsteps_mask[:, s, b] .= 1
+    set_board_input!(inputs, state.board, si, bi)
+    policy_target[:, si, bi] .= true
+    nsteps_target[:, si, bi] .= false
+    nsteps_mask[:, si, bi] .= true
     if n_moves > 0
-        nsteps_target[1, s, b] = Float32(1) # solved.
+        nsteps_target[1, si, bi] = true # solved.
     else
-        nsteps_target[end, s, b] = Float32(1) # infinite steps to solve w/out undo
+        nsteps_target[end, si, bi] = true # cannot be solved
     end
 end
 
@@ -1188,11 +1187,11 @@ function convert_training_entry!(
 end
 
 function clear!(data::SokobanPolicyLevel0Data, batch_index::Int)
-    data.inputs[:, :, :, :, batch_index] .= 0
-    data.policy_mask[:, :, batch_index] .= 0 # don't train on it
-    data.nsteps_mask[:, :, batch_index] .= 0 # don't train on it
-    data.policy_target[:, :, batch_index] .= 1.0/size(data.policy_target, 1)
-    data.nsteps_target[:, :, batch_index] .= 1.0/size(data.nsteps_target, 1)
+    data.inputs[:, :, :, :, batch_index] .= false
+    data.policy_mask[:, :, batch_index] .= false
+    data.nsteps_mask[:, :, batch_index] .= false
+    data.policy_target[:, :, batch_index] .= true
+    data.nsteps_target[:, :, batch_index] .= true
     return data
 end
 
@@ -1239,7 +1238,7 @@ end
 # --------------------------------------------------------------------------
 
 mutable struct BeamSearchData
-    inputs::Array{Float32}  # [8×8×5×s×b]
+    inputs::Array{Bool}     # [8×8×5×s×b]
     moves::Array{Direction} #       [s×b]  The move trajectories maintained by beam search
     scores::Vector{Float32} #         [b]  The running log likelihoods for the beam
     depth::Int              # How deep we got before returning. moves[depth] is the last move we used.
@@ -1273,7 +1272,7 @@ function beam_search!(
     # At the start, we only have a single beam (the root trajectory)
     n_beams = 1
 
-    inputs_next = zeros(Float32, size(inputs))
+    inputs_next = zeros(Bool, size(inputs))
     states_next = Array{State}(undef, b)
     moves_next = zeros(Direction, (s, b))
 
@@ -1374,16 +1373,16 @@ end
 
 # --------------------------------------------------------------------------
 
-mutable struct RolloutData
-    inputs::Array{Float32}  # [8 × 8 × 5 × s × b]
-    moves::Array{Direction} # [s × b] The moves for the rollouts
-    rewards::Array{Float32} # [s × b] The per-step rewards
+mutable struct RolloutData0
+    inputs::Array{Bool}     # [8×8×5×s×b] or [e×s×b]
+    moves::Array{Direction} # [s×b] The moves for the rollouts
+    rewards::Array{Float32} # [s×b] The per-step rewards
     depths::Vector{Int}     # [b] How deep each rollout is
 end
 
 # Run the model in parallel to produce rollouts
 function rollout!(
-    data::RolloutData,
+    data::RolloutData0,
     policy::SokobanPolicyLevel0,
     s_starts::Vector{Board}, # [b] the starting boards
     s_goals::Vector{Board};  # [b] the goal boards
@@ -1790,9 +1789,9 @@ function (m::SokobanPolicyLevel1)(input::AbstractArray{Float32, 5}) # [8×8×5×
         X = layer(X, m.mask)
     end
 
-    action_logits   = m.action_head(X) # [  a×s×b]
-    nsteps_logits   = m.nsteps_head(X) # [  7×s×b]
-    goal_embeddings_μ = m.goalem_head_μ(X) # [e×a×s×b]
+    action_logits        = m.action_head(X)      # [  a×s×b]
+    nsteps_logits        = m.nsteps_head(X)      # [  7×s×b]
+    goal_embeddings_μ    = m.goalem_head_μ(X)    # [e×a×s×b]
     goal_embeddings_logν = m.goalem_head_logν(X) # [e×a×s×b]
 
     return (action_logits, nsteps_logits, goal_embeddings_μ, goal_embeddings_logν)
@@ -2123,58 +2122,238 @@ function calc_metrics_gpu(
     )
 end
 
+# --------------------------------------------------------------------------
 
-# function rollout(
-#     policy0::SokobanPolicyLevel0,
-#     policy1::SokobanPolicyLevel1,
-#     inputs0_cpu::AbstractArray{Float32}, # 8×8×5×s×b
-#     inputs1_cpu::AbstractArray{Float32}, # 8×8×5×s×b
-#     board::Board)
+mutable struct RolloutResults1
+    # Moves are stored as just a long list that we append to
+    moves::Vector{Vector{Direction}} # [b]
 
-#     b = policy1.batch_size
+    # Delineations between L0 and L1 are captured here
+    # The length of moves[bi] is added here at the start of every L0 call
+    level_delineations::Vector{Vector{Int}} # [b]
 
-#     num_running = b
-#     is_done = falses(b) # keep track of whether each rollout is done
-#     n_steps = zeros(Int, b)
-#     states = [State(Game(board)) for i in 1:b]
-#     gumbel = Gumbel(0, 1)
+    # Whether each run was solved
+    solved::BitVector
+end
 
-#     # Construct a goal board where all boxes are on goals.
-#     goal_board = construct_naive_goal_board(board)
+function rollout(
+    policy0::SokobanPolicyLevel0,
+    policy1::SokobanPolicyLevel1,
+    inputs0_cpu::Array{Float32}, # [8×8×5×s×b]
+    inputs1_cpu::Array{Float32}, # [    e×s×b]
+    board::Board)
 
-#     # Fill the goals into the first sequence channel
-#     for bi in 1:b
-#         set_board_input!(inputs1_cpu, goal_board, 1, bi)
-#     end
+    policy1 = gpu(policy1)
+    policy0 = gpu(policy0)
 
-#     # Fill the start states in the next sequence channel
-#     for (bi, s_start) in enumerate(s_starts)
-#         set_board_input!(inputs1_cpu, board, 2, bi)
-#     end
+    # TODO: Add to inputs
+    board_input = Array{Float32}(undef, 8, 8, 5, 1, 1)
 
-#     # Simulate forward
-#     for si in 2:s
-#         if num_running ≤ 0
-#             break
-#         end
+    s0 = policy0.max_seq_len
+    s1 = policy1.max_seq_len
+    b = policy1.batch_size
+    e = policy1.encoding_dim
 
-#         ℓ_gpu, nsteps_logits_gpu, μ_gpu, logν_gpu = policy1(gpu(inputs1_cpu))
+    num_running = b
+    solved1 = falses(b) # keep track of whether each rollout is done
+    solved0 = falses(b)
+    n_steps = zeros(Int, b)
+    states = [State(Game(deepcopy(board))) for i in 1:b]
 
-#         # Sample from the actions using the Gumbel-max trick
-#         gumbel_noise = rand(gumbel, size(policy_logits_seq)) |> gpu
-#         sampled_actions = argmax(ℓ_gpu .+ gumbel_noise, dims=1) |> cpu
+    moves = [Direction[] for i in 1:b]
+    level_delineations = [Int[] for i in 1:b]
 
-#         # Apply the selected goal embeddings to the level-0 problem.
-#         for (bi, is_running) in enumerate(is_done)
-#             if !is_running
-#                 continue
-#             end
+    gumbel = Gumbel(0, 1)
 
-#             fill!(inputs0_cpu, zero(Float32))
+    # Construct a goal board where all boxes are on goals.
+    goal_board = construct_naive_goal_board(board)
 
-#             # TODO: I need a way to bypass the normal goal input with an embedding.
-#             set_board_input!(inputs0_cpu, goal_board, 1, bi)
-#             set_board_input!(inputs0_cpu, goal_board, 1, bi)
-#         end
-#     end
-# end
+    # Fill the goals into the first sequence channel
+    for bi in 1:b
+        set_board_input!(inputs1_cpu, goal_board, 1, bi)
+    end
+
+    # Fill the start states in the next sequence channel
+    for (bi, s_start) in enumerate(states)
+        set_board_input!(inputs1_cpu, board, 2, bi)
+    end
+
+    # Simulate forward
+    for si1 in 2:s1
+        if num_running ≤ 0
+            break
+        end
+
+        inputs1_gpu = gpu(inputs1_cpu)
+        ℓ_gpu, nsteps_logits_gpu, μ_gpu, logν_gpu = policy1(inputs1_gpu)
+
+        ℓ_cpu = cpu(ℓ_gpu)[:,si1,:] #   [a×b]
+        μ_cpu = cpu(μ_gpu)[:,:,si1,:] # [e×a×b]
+        σ_cpu = cpu(sqrt.(exp.(logν_gpu)))[:,:,si1,:] # [e×a×b]
+
+        # Sample from the actions using the Gumbel-max trick
+
+        gumbel_noise = rand(gumbel, size(ℓ_cpu))
+        sampled_actions = argmax(ℓ_cpu .+ gumbel_noise, dims=1) # [b]
+
+        # Apply the selected goal embeddings to the level-0 problem.
+        fill!(inputs0_cpu, zero(Float32))
+        for (bi, is_finished) in enumerate(solved1)
+            if is_finished
+                continue
+            end
+
+            ai = sampled_actions[bi][1]
+            inputs0_cpu[:,1,bi] = μ_cpu[:,ai,bi] + σ_cpu[:,ai,bi].*randn(e)
+
+            # TODO: This is horribly inefficient
+            inputs0_cpu[:,2,bi] = cpu(policy0.encoder(inputs1_gpu))[:,si1,bi]
+
+            push!(level_delineations[bi], length(moves[bi]))
+        end
+
+        # Run the level-0 problem
+        num_running2 = num_running
+        solved0[:] = solved1
+        for si0 in 2:s0
+            if num_running2 ≤ 0
+                break
+            end
+
+            # Run the model
+            # policy_logits are [4 × s × b]
+            # nsteps_logits are [7 × s × b]
+            policy_logits_gpu, nsteps_logits_gpu = policy0(gpu(inputs0_cpu))
+
+            nsteps_probs = softmax(cpu(nsteps_logits_gpu), dims=1) # [7 × s × b]
+
+            # Pull out the logits for our current sequence index.
+            policy_logits_seq = cpu(policy_logits_gpu)[:,si0,:] # [4 × b]
+
+            # Sample from the action logits using the Gumbel-max trick
+            gumbel_noise = rand(gumbel, size(policy_logits_seq))
+            sampled_actions = argmax(policy_logits_seq .+ gumbel_noise, dims=1)
+
+            # Apply the actions
+            for bi in 1:b
+                if solved0[bi]
+                    continue # no need to simulate this one any further
+                end
+
+                # Grab the sampled action
+                ai = sampled_actions[bi][1]
+                dir = Direction(ai)
+                push!(moves[bi], dir)
+
+                # Simulate the state forward
+                successful_move = maybe_move!(states[bi], dir)
+
+                # Stop when the stopping likelihood is high
+                # Note that this does not mean that the overall rollout is done, just this L0 rollout is.
+                if nsteps_probs[si0] > 0.5
+                    solved0[bi] = true
+                    num_running2 -= 1
+                end
+
+                # Fill in the next input
+                if si0 < s0
+                    # TODO: This is all inefficient
+                    set_board_input!(board_input, states[bi].board, 1, 1)
+                    inputs0_cpu[:,si0+1,bi] = cpu(policy0.encoder(gpu(board_input)))[:,1,1]
+                end
+            end
+        end
+
+        for bi in 1:b
+            if !solved1[bi] && is_solved(states[bi])
+                solved1[bi] = true
+                num_running -= 1
+            end
+        end
+    end
+
+    return RolloutResults1(moves, level_delineations, solved1)
+end
+
+# Run a batch worth of rollouts per training entry, and see how well we do in terms of solving it.
+# The goal in each case is just to solve each board.
+function calc_rollout_metrics(
+    policy0::SokobanPolicyLevel0,
+    policy1::SokobanPolicyLevel1,
+    boards::Vector{Board})
+
+    b = policy1.batch_size
+    s0 = policy0.max_seq_len
+    s1 = policy1.max_seq_len
+    e0 = policy0.encoding_dim
+    e1 = policy1.encoding_dim
+
+    n_boards = length(boards)
+    n_rollouts = b*n_boards
+
+    # The number of total rollouts that resulted in a solved board
+    n_solved_per_rollout = 0
+
+    # The number of boards for which at least one rollout solved the board
+    n_solved_per_board = 0
+
+    # The mean step-solution length
+    n_steps_per_rollout = 0 # across all rollouts
+    n_steps_per_solution = 0 # across all solved rollouts
+    n_steps_per_board = 0 # min per board
+
+    # The mean L1-action length
+    n_l1act_per_rollout = 0
+    n_l1act_per_solution = 0
+    n_l1act_per_board = 0
+
+    @assert policy0.batch_size == b # assumed for now
+
+    inputs0_cpu = Array{Float32}(undef, e0, s0, b)
+    inputs1_cpu = Array{Float32}(undef, 8, 8, 5, s1, b)
+
+    for board in boards
+        res = rollout(policy0, policy1, inputs0_cpu, inputs1_cpu, board)
+        n_solved_per_rollout += sum(res.solved)
+        n_solved_per_board += any(res.solved)
+        n_steps_per_rollout += sum(length.(res.moves))
+        n_steps_per_solution += sum(res.solved[bi] * length(res.moves[bi]) for bi in 1:b)
+        n_steps_per_board += any(res.solved) ? minimum(res.solved[bi] * length(res.moves[bi]) for bi in 1:b) : 0
+        n_l1act_per_rollout += sum(length.(res.level_delineations))
+        n_l1act_per_solution += sum(res.solved[bi] * length(res.level_delineations[bi]) for bi in 1:b)
+        n_l1act_per_board += any(res.solved) ? minimum(res.solved[bi] * length(res.level_delineations[bi]) for bi in 1:b) : 0
+    end
+
+    return Dict{String, Float64}(
+        "n_boards"                => n_boards,
+        "n_rollouts_per_board"    => b,
+        "solve_rate_all_rollouts" => n_solved_per_rollout / n_rollouts,
+        "solve_rate_per_board"    => n_solved_per_board / n_boards,
+        "ave_nsteps_per_rollout"  => n_steps_per_rollout / n_rollouts,
+        "ave_nsteps_per_solution" => n_steps_per_solution / n_solved_per_rollout,
+        "ave_nsteps_per_board"    => n_steps_per_board / n_boards,
+        "ave_l1act_per_rollout"   => n_l1act_per_rollout / n_rollouts,
+        "ave_l1act_per_solution"  => n_l1act_per_solution / n_solved_per_rollout,
+        "ave_l1act_per_board"     => n_l1act_per_board / n_boards,
+    )
+end
+
+# GOAL: evaluate rollouts for validation set
+#  1. run it as-is and see how bad performance is
+#  2. validate rollouts by
+#            1. running with real board encoding
+#            2. printouts
+#  3. on GPU
+
+
+# Dict{String, Float64} with 10 entries:
+#   "ave_nsteps_per_rollout"  => 375.083
+#   "n_rollouts_per_board"    => 32.0
+#   "ave_nsteps_per_board"    => 0.0
+#   "ave_l1act_per_board"     => 0.0
+#   "solve_rate_per_board"    => 0.08
+#   "ave_nsteps_per_solution" => 127.167
+#   "ave_l1act_per_solution"  => 21.1429
+#   "ave_l1act_per_rollout"   => 62.4506
+#   "n_boards"                => 100.0
+#   "solve_rate_all_rollouts" => 0.013125
