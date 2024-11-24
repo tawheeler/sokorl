@@ -2,6 +2,13 @@ using Dates
 using Distributions
 using Flux
 
+# The dimension indices for the board sparse encoding
+const DIM_WALL = 1
+const DIM_FLOOR = 2
+const DIM_GOAL = 3
+const DIM_BOX = 4
+const DIM_PLAYER = 5
+
 # --------------------------------------------------------------------------
 
 function place_all_boxes_on_goals!(board::Board)
@@ -704,7 +711,7 @@ end
 
 # Load all of the training entries in a directory and its subdirectories
 function load_training_set(T, directory::String)
-    entries = TrainingEntry0[]
+    entries = T[]
 
     for content in readdir(directory)
         fullpath = joinpath(directory, content)
@@ -777,11 +784,11 @@ function set_board_input!(
     for row in 1:nrows
         for col in 1:ncols
             v = board[col, row]
-            inputs[col, row, 1, i_seq, i_batch] = is_set(v, BOX)
-            inputs[col, row, 2, i_seq, i_batch] = is_set(v, FLOOR)
-            inputs[col, row, 3, i_seq, i_batch] = is_set(v, GOAL)
-            inputs[col, row, 4, i_seq, i_batch] = is_set(v, PLAYER)
-            inputs[col, row, 5, i_seq, i_batch] = is_set(v, WALL)
+            inputs[col, row, DIM_WALL,   i_seq, i_batch] = is_set(v, WALL)
+            inputs[col, row, DIM_FLOOR,  i_seq, i_batch] = is_set(v, FLOOR)
+            inputs[col, row, DIM_GOAL,   i_seq, i_batch] = is_set(v, GOAL)
+            inputs[col, row, DIM_BOX,    i_seq, i_batch] = is_set(v, BOX)
+            inputs[col, row, DIM_PLAYER, i_seq, i_batch] = is_set(v, PLAYER)
         end
     end
     return inputs
@@ -796,14 +803,142 @@ function set_board_from_input!(
     for row in 1:nrows
         for col in 1:ncols
             board[col, row] =
-                inputs[col, row, 1, i_seq, i_batch] * BOX +
-                inputs[col, row, 2, i_seq, i_batch] * FLOOR +
-                inputs[col, row, 3, i_seq, i_batch] * GOAL +
-                inputs[col, row, 4, i_seq, i_batch] * PLAYER +
-                inputs[col, row, 5, i_seq, i_batch] * WALL
+                inputs[col, row, DIM_WALL,   i_seq, i_batch] * WALL +
+                inputs[col, row, DIM_FLOOR,  i_seq, i_batch] * FLOOR +
+                inputs[col, row, DIM_GOAL,   i_seq, i_batch] * GOAL +
+                inputs[col, row, DIM_BOX,    i_seq, i_batch] * BOX +
+                inputs[col, row, DIM_PLAYER, i_seq, i_batch] * PLAYER
         end
     end
     return board
+end
+
+# --------------------------------------------------------------------------
+
+"""
+Shift the given tensor in its 1st and 2nd dimension with zero-padding.
+
+e.g. shift_tensor(tensor, 1, 0, 0) will produce:
+
+   [1 1 1 1 1]      [  1 1 1 1]
+   [1 2     1]      [  1 2    ]
+   [1   1   1]  ->  [  1   1  ]
+   [1 1 1 1 1]      [  1 1 1 1]
+"""
+function shift_tensor(tensor::AbstractArray, d_row::Integer, d_col::Integer, pad_value)
+    pad_up    = max( d_row, 0)
+    pad_down  = max(-d_row, 0)
+    pad_left  = max( d_col, 0)
+    pad_right = max(-d_col, 0)
+
+    tensor_padded = NNlib.pad_constant(
+        tensor,
+        (pad_up, pad_down, pad_left, pad_right, (0 for i in 1:2*(ndims(tensor)-2))...),
+        pad_value)
+
+    dims = size(tensor_padded)
+    row_lo = 1 + pad_down
+    row_hi = dims[1] - pad_up
+    col_lo = 1 + pad_right
+    col_hi = dims[2] - pad_left
+
+    return tensor_padded[row_lo:row_hi, col_lo:col_hi, (Colon() for d in dims[3:end])...]
+end
+
+"""
+Advance all sparse board states by moving one step in the row and column space.
+
+  UP    = (d_row=-1, d_col= 0)
+  LEFT  = (d_row= 0, d_col=-1)
+  DOWN  = (d_row=+1, d_col= 0)
+  RIGHT = (d_row= 0, d_col=+1)
+
+Returns two new tensors:
+    player_new: [8,8,s,b]
+    boxes_new:  [8,8,s,b]
+"""
+function advance_boards(
+    inputs::AbstractArray{Bool}, # [8,8,5,s,b]
+    d_row::Integer,
+    d_col::Integer)
+
+    boxes  = inputs[:,:,DIM_BOX,   :,:]
+    player = inputs[:,:,DIM_PLAYER,:,:]
+    walls  = inputs[:,:,DIM_WALL,  :,:]
+
+    player_shifted = shift_tensor(player, d_row, d_col, false)
+    player_2_shift = shift_tensor(player_shifted, d_row, d_col, false)
+
+    # A move is valid if the player destination is empty
+    # or if its a box and the next space over is empty
+    not_box_or_wall = .!(boxes .| walls)
+
+    # 1 if it is a valid player destination tile for a basic player move (not a push)
+    move_space_empty = player_shifted .& not_box_or_wall
+
+    # 1 if the tile is a player destination tile containing a box
+    move_space_isbox = player_shifted .& boxes
+
+    # 1 if the tile is a player destination tile whose next one over is a valid box push receptor
+    push_space_empty = player_shifted .& shift_tensor(not_box_or_wall, -d_row, -d_col, false)
+
+    # 1 if it is a valid player move destination
+    move_mask = move_space_empty
+
+    # 1 if it is a valid player push destination
+    # (which also means it currently has a box)
+    push_mask = next_space_isbox .& push_space_empty
+
+    # new player location
+    mask = move_mask .| push_mask
+    player_new = mask .| (player .* shift_tensor(.!mask, -d_row, -d_col, false))
+
+    # new box location
+    box_destinations = shift_tensor(boxes .* push_mask, d_row, d_col, false)
+    boxes_new = boxes .* (.!push_mask) .| box_destinations
+
+    return player_new, boxes_new
+end
+
+function advance_boards(
+    inputs::AbstractArray{Bool}, # [8,8,5,s,b]
+    actions::AbstractArray{Int}) #       [s,b]
+
+    succ_u = advance_boards(inputs, -1,  0) # [8,8,s,d], [8,8,s,d]
+    succ_l = advance_boards(inputs,  0, -1)
+    succ_d = advance_boards(inputs,  1,  0)
+    succ_r = advance_boards(inputs,  0,  1)
+
+    size_u = size(succ_u[1])
+    target_dims = (size_u[1], size_u[2], 1, size_u[3:end]...)
+    player_news = cat(
+        reshape(succ_u[1], target_dims),
+        reshape(succ_l[1], target_dims),
+        reshape(succ_d[1], target_dims),
+        reshape(succ_r[1], target_dims), dims=3) # [8,8,a,s,d]
+    box_news = cat(
+        reshape(succ_u[2], target_dims),
+        reshape(succ_l[2], target_dims),
+        reshape(succ_d[2], target_dims),
+        reshape(succ_r[2], target_dims), dims=3) # [8,8,a,s,d]
+
+    actions_onehot = onehotbatch(actions, 1:4) # [a,s,d]
+    actions_onehot = reshape(actions_onehot, (1,1,size(actions_onehot)...))
+
+    boxes_new = any(actions_onehot .& box_news, dims=3)
+    player_new = any(actions_onehot .& player_news, dims=3)
+
+    return cat(inputs[:,:,1:3,:,:], boxes_new, player_new, dims=3)
+end
+
+function advance_board_inputs(
+    inputs::AbstractArray{Bool}, # [8,8,5,s,b]
+    actions::AbstractArray{Int}) #       [s,b]
+
+    inputs_new = advance_boards(inputs, actions)
+
+    # Right shift and keep the goal and starting state
+    return cat(inputs[:, :, :, 1:2, :], inputs_new[:, :, :, 2:end-1, :], dims=4)
 end
 
 # --------------------------------------------------------------------------
