@@ -1,6 +1,8 @@
 using Dates
 using Distributions
 using Flux
+using NNlib
+using OneHotArrays
 
 # The dimension indices for the board sparse encoding
 const DIM_WALL = 1
@@ -785,7 +787,7 @@ function set_board_input!(
         for col in 1:ncols
             v = board[col, row]
             inputs[col, row, DIM_WALL,   i_seq, i_batch] = is_set(v, WALL)
-            inputs[col, row, DIM_FLOOR,  i_seq, i_batch] = is_set(v, FLOOR)
+            inputs[col, row, DIM_FLOOR,  i_seq, i_batch] = !is_set(v, WALL)
             inputs[col, row, DIM_GOAL,   i_seq, i_batch] = is_set(v, GOAL)
             inputs[col, row, DIM_BOX,    i_seq, i_batch] = is_set(v, BOX)
             inputs[col, row, DIM_PLAYER, i_seq, i_batch] = is_set(v, PLAYER)
@@ -804,7 +806,6 @@ function set_board_from_input!(
         for col in 1:ncols
             board[col, row] =
                 inputs[col, row, DIM_WALL,   i_seq, i_batch] * WALL +
-                inputs[col, row, DIM_FLOOR,  i_seq, i_batch] * FLOOR +
                 inputs[col, row, DIM_GOAL,   i_seq, i_batch] * GOAL +
                 inputs[col, row, DIM_BOX,    i_seq, i_batch] * BOX +
                 inputs[col, row, DIM_PLAYER, i_seq, i_batch] * PLAYER
@@ -858,7 +859,7 @@ Returns two new tensors:
     boxes_new:  [8,8,s,b]
 """
 function advance_boards(
-    inputs::AbstractArray{Bool}, # [8,8,5,s,b]
+    inputs::AbstractArray{Bool}, # [h,w,f,s,b]
     d_row::Integer,
     d_col::Integer)
 
@@ -887,7 +888,7 @@ function advance_boards(
 
     # 1 if it is a valid player push destination
     # (which also means it currently has a box)
-    push_mask = next_space_isbox .& push_space_empty
+    push_mask = move_space_isbox .& push_space_empty
 
     # new player location
     mask = move_mask .| push_mask
@@ -895,16 +896,16 @@ function advance_boards(
 
     # new box location
     box_destinations = shift_tensor(boxes .* push_mask, d_row, d_col, false)
-    boxes_new = boxes .* (.!push_mask) .| box_destinations
+    boxes_new = (boxes .* (.!push_mask)) .| box_destinations
 
     return player_new, boxes_new
 end
 
 function advance_boards(
-    inputs::AbstractArray{Bool}, # [8,8,5,s,b]
+    inputs::AbstractArray{Bool}, # [h,w,f,s,b]
     actions::AbstractArray{Int}) #       [s,b]
 
-    succ_u = advance_boards(inputs, -1,  0) # [8,8,s,d], [8,8,s,d]
+    succ_u = advance_boards(inputs, -1,  0) # [h,w,s,d], [h,w,s,d]
     succ_l = advance_boards(inputs,  0, -1)
     succ_d = advance_boards(inputs,  1,  0)
     succ_r = advance_boards(inputs,  0,  1)
@@ -915,15 +916,15 @@ function advance_boards(
         reshape(succ_u[1], target_dims),
         reshape(succ_l[1], target_dims),
         reshape(succ_d[1], target_dims),
-        reshape(succ_r[1], target_dims), dims=3) # [8,8,a,s,d]
+        reshape(succ_r[1], target_dims), dims=3) # [h,w,a,s,d]
     box_news = cat(
         reshape(succ_u[2], target_dims),
         reshape(succ_l[2], target_dims),
         reshape(succ_d[2], target_dims),
-        reshape(succ_r[2], target_dims), dims=3) # [8,8,a,s,d]
+        reshape(succ_r[2], target_dims), dims=3) # [h,w,a,s,d]
 
     actions_onehot = onehotbatch(actions, 1:4) # [a,s,d]
-    actions_onehot = reshape(actions_onehot, (1,1,size(actions_onehot)...))
+    actions_onehot = reshape(actions_onehot, (1,1,size(actions_onehot)...)) # [1,1,a,s,d]
 
     boxes_new = any(actions_onehot .& box_news, dims=3)
     player_new = any(actions_onehot .& player_news, dims=3)
@@ -938,7 +939,7 @@ function advance_board_inputs(
     inputs_new = advance_boards(inputs, actions)
 
     # Right shift and keep the goal and starting state
-    return cat(inputs[:, :, :, 1:2, :], inputs_new[:, :, :, 2:end-1, :], dims=4)
+    return cat(inputs[:, :, :, 1:2, :], inputs_new[:, :, :, 2:end-1, :], dims=4) # [8,8,5,s,b]
 end
 
 # --------------------------------------------------------------------------
@@ -1508,6 +1509,63 @@ end
 
 # --------------------------------------------------------------------------
 
+function sample_gumbel_noise(s::Integer, b::Integer)
+    return rand(Gumbel{Float32}(0.0f0, 1.0f0), (4, s, b))
+end
+
+"""
+Run parallel rollouts using the given model, updating the provided inputs tensor.
+The rollout happens on the GPU.
+"""
+function rollouts!(
+    inputs::Array{Bool, 5},      # [h×w×f×s×b]
+    gumbel_noise::Array{Float32, 3}, # [4×s×b]
+    policy0::SokobanPolicyLevel0,
+    s_starts::Vector{Board}, # [b]
+    s_goals::Vector{Board}) # [b]
+
+    policy0 = gpu(policy0)
+
+    h, w, f, s, b = size(inputs)
+
+    @assert length(s_starts) == b
+    @assert length(s_goals) == b
+
+    # Fill the goals into the first sequence channel
+    for (bi, s_goal) in enumerate(s_goals)
+        set_board_input!(inputs, s_goal, 1, bi)
+    end
+
+    # Fill the start states in the second sequence channel
+    for (bi, s_start) in enumerate(s_starts)
+        set_board_input!(inputs, s_start, 2, bi)
+    end
+
+    inputs_gpu = gpu(inputs)
+    gumbel_noise_gpu = gpu(gumbel_noise)
+
+    for si in 2:s-1
+
+        # Run the model
+        # policy_logits are [4 × s × b]
+        # nsteps_logits are [7 × s × b]
+        policy_logits_gpu, nsteps_logits_gpu = policy0(inputs_gpu)
+
+        #     # Optionally bias the policy logits.
+        #     policy_logits_seq[:,:] .+= policy_dirichlet_prior # [4 × b]
+
+        # Sample from the action logits using the Gumbel-max trick
+        actions_gpu = argmax(policy_logits_gpu .+ gumbel_noise_gpu, dims=1) # CartesianIndex{3}[1 × s × ,b]
+        actions_gpu = getindex.(actions_gpu, 1) # Int64[1 × s × b]
+        actions_gpu = dropdims(actions_gpu, dims=1) # Int64[s × b]
+
+        # Apply the actions
+        inputs_gpu = advance_board_inputs(inputs_gpu, actions_gpu)
+    end
+
+    return cpu(inputs_gpu)
+end
+
 mutable struct RolloutData0
     inputs::Array{Bool}     # [8×8×5×s×b] or [e×s×b]
     moves::Array{Direction} # [s×b] The moves for the rollouts
@@ -1531,8 +1589,6 @@ function rollout!(
     moves = data.moves
     rewards = data.rewards
     depths = data.depths
-
-    gumbel = Gumbel(0, 1)
 
     s = size(inputs_cpu, 4)
     b = size(inputs_cpu, 5)
@@ -1579,7 +1635,7 @@ function rollout!(
         policy_logits_seq[:,:] .+= policy_dirichlet_prior # [4 × b]
 
         # Sample from the action logits using the Gumbel-max trick
-        gumbel_noise = rand(gumbel, size(policy_logits_seq))
+        gumbel_noise = rand(Gumbel{Float32}(0.0f0, 1.0f0), size(policy_logits_seq))
         sampled_actions = argmax(policy_logits_seq .+ gumbel_noise, dims=1)
 
         # Apply the actions
@@ -2298,7 +2354,7 @@ function rollout(
     moves = [Direction[] for i in 1:b]
     level_delineations = [Int[] for i in 1:b]
 
-    gumbel = Gumbel(0, 1)
+    gumbel = Gumbel{Float32}(0.0f0, 1.0f0)
 
     # Construct a goal board where all boxes are on goals.
     goal_board = construct_naive_goal_board(board)
