@@ -1381,7 +1381,7 @@ mutable struct BeamSearchData
     solution::Int           # Batch index of the trajectory that solves the problem (or -1 otherwise)
 end
 
-function beam_search!(
+function beam_search_old!(
         data::BeamSearchData,
         s_start::Board,
         s_goal::Board,
@@ -1505,6 +1505,66 @@ function beam_search!(
     data.solution = -1
     data.depth = b
     return data
+end
+
+function beam_search!(
+    inputs::Array{Bool, 5},      # [h×w×f×s×b]
+    policy0::SokobanPolicyLevel0,
+    s_start::Board,
+    s_goal::Board)
+
+    policy0 = gpu(policy0)
+
+    h, w, f, s, b = size(inputs)
+
+    # Fill the goals and starting states into the first sequence channel
+    for bi in 1:b
+        set_board_input!(inputs, s_goal, 1, bi)
+        set_board_input!(inputs, s_start, 2, bi)
+    end
+
+    # The scores all start at zero
+    beam_scores = zeros(Float32, 1, b) |> gpu # [1, b]
+
+    # Keep track of the actual actions
+    actions = ones(Int, s, b) |> gpu # [s, b]
+
+    inputs_gpu = gpu(inputs)
+
+    # Advance the games in parallel
+    for si in 2:s-1 TODO
+
+        # Run the model
+        # policy_logits are [4 × s × b]
+        # nsteps_logits are [7 × s × b]
+        policy_logits, nsteps_logits = policy0(inputs_gpu)
+
+        # Compute the probabilities
+        # TODO: Switch to likelihood of being able to solve it from here
+        action_probs = softmax(policy_logits, dims=1) # [4 × s × b]
+        action_logls = log.(action_probs) # [4 × s × b]
+
+        # The beam scores are the running log likelihoods
+        action_logls_si = action_logls[:, si, :]  # [4, b]
+        candidate_beam_scores = action_logls_si .+ beam_scores # [4, b]
+        candidate_beam_scores_flat = vec(candidate_beam_scores) # [4b]
+
+        # Get the top 'b' beams
+        topk_indices = partialsortperm(candidate_beam_scores_flat, 1:b; rev=true)
+
+        # Convert flat indices back to action and beam indices
+        selected_actions = (topk_indices .- 1) .÷ b .+ 1  # [b] action indices (1 to 4)
+        selected_beams   = (topk_indices .- 1) .% b .+ 1  # [b] beam indices (1 to b)
+        selected_scores  = candidate_beam_scores_flat[topk_indices]  # [b]
+        inputs_gpu = inputs_gpu[:,:,:,:,selected_beams]
+
+        actions[si,:] = selected_actions
+
+        # Apply the actions to the selected beams
+        inputs = advance_board_inputs(inputs_gpu, actions)
+    end
+
+    return (cpu(inputs_gpu), cpu(actions))
 end
 
 # --------------------------------------------------------------------------
