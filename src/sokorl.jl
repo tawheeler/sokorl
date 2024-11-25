@@ -1971,7 +1971,7 @@ function load_policy(::Type{SokobanPolicyLevel1}, model_directory::AbstractStrin
     return policy
 end
 
-function (m::SokobanPolicyLevel1)(input::AbstractArray{Float32, 5}) # [8×8×5×s×b]
+function (m::SokobanPolicyLevel1)(input::AbstractArray{Bool, 5}) # [8×8×5×s×b]
 
     X = m.encoder(input) .+ m.pos_enc
     X = m.dropout(X)
@@ -1990,21 +1990,21 @@ end
 
 # TODO: Could most of these be UInt8 since they are sparse?
 struct SokobanPolicyLevel1Data
-    inputs::AbstractArray{Float32} # 8 × 8 × 5 × s × b
-    policy_target::AbstractArray{Float32}  # e × s × b (embeddings)
-    nsteps_target::AbstractArray{Float32}  # 7 × s × b
-    policy_mask::AbstractArray{Int32}      # 1 × s × b
-    nsteps_mask::AbstractArray{Int32}      # 7 × s × b
+    inputs::AbstractArray{Bool}   # 8 × 8 × 5 × s × b
+    policy_target::AbstractArray{Float32} # e × s × b (embeddings)
+    nsteps_target::AbstractArray{Bool}    # 7 × s × b
+    policy_mask::AbstractArray{Bool}      # 1 × s × b
+    nsteps_mask::AbstractArray{Bool}      # 7 × s × b
 end
 
 function SokobanPolicyLevel1Data(max_seq_len::Int, batch_size::Int, encoding_dim::Int, n_actions::Int)
     s, b, e, a = max_seq_len, batch_size, encoding_dim, n_actions
 
-    inputs = zeros(Float32, (8, 8, 5, s,  b))
+    inputs     = zeros(Bool, (8, 8, 5, s, b))
     policy_target = zeros(Float32, (e, s, b))
-    nsteps_target = zeros(Float32, (7, s, b))
-    policy_mask = zeros(Int32, (1, s, b))
-    nsteps_mask = zeros(Int32, (7, s, b))
+    nsteps_target = zeros(Bool,    (7, s, b))
+    policy_mask   = zeros(Bool,    (1, s, b))
+    nsteps_mask   = zeros(Bool,    (7, s, b))
     return SokobanPolicyLevel1Data(inputs, policy_target, nsteps_target, policy_mask, nsteps_mask)
 end
 
@@ -2037,72 +2037,79 @@ end
 
 # # Unpack a TrainingEntry1 into the tensor representation used by the model.
 function convert_training_entry!(
-        inputs::Array{Float32},    # 8×8×5×s×b
+        inputs::Array{Bool},       # 8×8×5×s×b
         policy_target::Array{Float32}, # e×s×b
-        nsteps_target::Array{Float32}, # 7×s×b
-        policy_mask::Array{Int32},     # a×s×b
-        nsteps_mask::Array{Int32},     # 7×s×b
+        nsteps_target::Array{Bool},    # 7×s×b
+        policy_mask::Array{Bool},      # a×s×b
+        nsteps_mask::Array{Bool},      # 7×s×b
         training_entry::TrainingEntry1,
         encoder::BoardEncoder,
         batch_index::Int)
 
+    h, w, f, s, b = size(inputs)
+
     # Ensure that our training entry is not longer than our model can handle
     n_states = length(training_entry.states)
-    @assert n_states < size(inputs, 4)
+    @assert n_states < s
 
-    b = batch_index
+    bi = batch_index
 
-    # Only train on things we set to 1
-    policy_mask[:, :, b] .= 0
-    nsteps_mask[:, :, b] .= 0
+    # Only train on things we set to true
+    policy_mask[:, :, bi] .= false
+    nsteps_mask[:, :, bi] .= false
 
     # The overall goal is the final state (sans player),
     # Or the one goal if it exists.
-    goal_board = deepcopy(length(training_entry.states) > 0 ? training_entry.states[end] : training_entry.goals[end])
+    goal_board = deepcopy(training_entry.s_start)
+    if length(training_entry.states) > 0
+        goal_board[:] = training_entry.states[end]
+    elseif length(training_entry.goals) > 0
+        goal_board[:] = training_entry.goals[end]
+    end
     remove_player!(goal_board)
 
     # The goal always goes into the first entry
-    set_board_input!(inputs, goal_board, 1, b)
-    policy_target[:, 1, b] .= 1.0/size(policy_target, 1)
-    nsteps_target[:, 1, b] .= 1.0/size(nsteps_target, 1)
+    set_board_input!(inputs, goal_board, 1, bi)
+    policy_target[:, 1, bi] .= true
+    nsteps_target[:, 1, bi] .= true
 
     # Walk through the game and place the states
     all_states = Board[]
     push!(all_states, training_entry.s_start)
     append!(all_states, training_entry.states)
 
-    goal_inputs = Array{Float32}(undef, 8, 8, 5, 1, 1)
+    goal_inputs = Array{Bool}(undef, h, w, f, 1, 1)
 
-    s = 2 # seq index
+    si = 2 # seq index
 
     # Note that all_states is 1 longer than goals, so we end up with an extra state.
     for (board, goal) in zip(all_states, training_entry.goals)
 
-        set_board_input!(inputs, board, s, b)
+        set_board_input!(inputs, board, si, bi)
         set_board_input!(goal_inputs, goal, 1, 1)
-        policy_target[:, s, b] = encoder(goal_inputs)[:,:,:,1,1]
+        policy_target[:, si, bi] = encoder(goal_inputs)[:,:,:,1,1]
 
-        nsteps_target[:, s, b] .= Float32(0)
-        nsteps_remaining = length(training_entry.states) + 1 - s
+        nsteps_target[:, si, bi] .= false
+        nsteps_remaining = length(training_entry.states) + 1 - si
         idx = Int(clamp(round(log(nsteps_remaining+1)), 0, 5)) + 1
-        nsteps_target[idx, s, b] = Float32(1)
+        nsteps_target[idx, si, bi] = true
 
-        policy_mask[:, s, b] .= 1 # train on the action
-        nsteps_mask[:, s, b] .= 1 # train on the step count
+        policy_mask[:, si, bi] .= true # train on the action
+        nsteps_mask[:, si, bi] .= true # train on the step count
 
-        s += 1
+        si += 1
     end
 
     # Always set the final state (which is the first state in an unsolved entry),
     # but the policy target is not trained on.
-    set_board_input!(inputs, all_states[end], s, b)
-    policy_target[:, s, b] .= Float32(0)
-    nsteps_target[:, s, b] .= Float32(0)
-    nsteps_mask[:, s, b] .= 1
+    set_board_input!(inputs, all_states[end], si, bi)
+    policy_target[:, si, bi] .= false
+    nsteps_target[:, si, bi] .= false
+    nsteps_mask[:, si, bi] .= 1
     if training_entry.solved
-        nsteps_target[1, s, b] = Float32(1) # solved.
+        nsteps_target[1, si, bi] = true # solved.
     else
-        nsteps_target[end, s, b] = Float32(1) # infinite steps to solve w/out undo
+        nsteps_target[end, si, bi] = true # infinite steps to solve w/out undo
     end
 end
 
@@ -2124,11 +2131,11 @@ function convert_training_entry!(
 end
 
 function clear!(data::SokobanPolicyLevel1Data, batch_index::Int)
-    data.inputs[:, :, :, :, batch_index] .= 0
+    data.inputs[:, :, :, :, batch_index] .= false
     data.policy_mask[:, :, batch_index] .= 0 # don't train on it
-    data.nsteps_mask[:, :, batch_index] .= 0 # don't train on it
-    data.policy_target[:, :, batch_index] .= 0.0 # empty embedding
-    data.nsteps_target[:, :, batch_index] .= 1.0/size(data.nsteps_target, 1)
+    data.nsteps_mask[:, :, batch_index] .= false # don't train on it
+    data.policy_target[:, :, batch_index] .= false # empty embedding
+    data.nsteps_target[:, :, batch_index] .= true
     return data
 end
 
@@ -2154,7 +2161,7 @@ function gmm_loss(
     μ::AbstractArray{Float32},
     logν::AbstractArray{Float32},
     y_true::AbstractArray{Float32},
-    mask::AbstractArray{Int32},
+    mask::AbstractArray{Bool},
     )
 
     w = softmax(ℓ; dims=1)  # mixing coeffs
