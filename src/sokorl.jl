@@ -10,6 +10,7 @@ const DIM_FLOOR = 2
 const DIM_GOAL = 3
 const DIM_BOX = 4
 const DIM_PLAYER = 5
+const NUM_SPARSE_BOARD_FEATURES = 5
 
 # --------------------------------------------------------------------------
 
@@ -855,17 +856,17 @@ Advance all sparse board states by moving one step in the row and column space.
   RIGHT = (d_row= 0, d_col=+1)
 
 Returns two new tensors:
-    player_new: [8,8,s,b]
-    boxes_new:  [8,8,s,b]
+    player_new: [h,w,s,b]
+    boxes_new:  [h,w,s,b]
 """
 function advance_boards(
     inputs::AbstractArray{Bool}, # [h,w,f,s,b]
     d_row::Integer,
     d_col::Integer)
 
-    boxes  = inputs[:,:,DIM_BOX,   :,:]
-    player = inputs[:,:,DIM_PLAYER,:,:]
-    walls  = inputs[:,:,DIM_WALL,  :,:]
+    boxes  = inputs[:,:,DIM_BOX,   :,:] # [h,w,s,b]
+    player = inputs[:,:,DIM_PLAYER,:,:] # [h,w,s,b]
+    walls  = inputs[:,:,DIM_WALL,  :,:] # [h,w,s,b]
 
     player_shifted = shift_tensor(player, d_row, d_col, false)
     player_2_shift = shift_tensor(player_shifted, d_row, d_col, false)
@@ -899,6 +900,14 @@ function advance_boards(
     boxes_new = (boxes .* (.!push_mask)) .| box_destinations
 
     return player_new, boxes_new
+end
+
+function are_solved(inputs::AbstractArray{Bool}) # [h,w,f,s,b]
+    boxes = inputs[:,:,DIM_BOX,  :,:] # [h,w,s,b]
+    goals = inputs[:,:,DIM_GOAL, :,:] # [h,w,s,b]
+    box_not_on_goal = boxes .⊻ goals
+    is_failed = reshape(any(box_not_on_goal, dims=(1,2)), (size(inputs, 4), size(inputs, 5))) # [s,b]
+    return .!is_failed  # [s,b]
 end
 
 function advance_boards(
@@ -1523,16 +1532,14 @@ function beam_search!(
         set_board_input!(inputs, s_start, 2, bi)
     end
 
-    # The scores all start at zero
-    beam_scores = zeros(Float32, 1, b) |> gpu # [1, b]
-
     # Keep track of the actual actions
     actions = ones(Int, s, b) |> gpu # [s, b]
 
     inputs_gpu = gpu(inputs)
 
     # Advance the games in parallel
-    for si in 2:s-1 TODO
+    si = 2
+    while si < s
 
         # Run the model
         # policy_logits are [4 × s × b]
@@ -1540,16 +1547,19 @@ function beam_search!(
         policy_logits, nsteps_logits = policy0(inputs_gpu)
 
         # Compute the probabilities
-        # TODO: Switch to likelihood of being able to solve it from here
         action_probs = softmax(policy_logits, dims=1) # [4 × s × b]
         action_logls = log.(action_probs) # [4 × s × b]
 
-        # The beam scores are the running log likelihoods
-        action_logls_si = action_logls[:, si, :]  # [4, b]
-        candidate_beam_scores = action_logls_si .+ beam_scores # [4, b]
-        candidate_beam_scores_flat = vec(candidate_beam_scores) # [4b]
+        # Base beam scores are how likely each beam thus far is to be solved
+        nsteps_probs = softmax(nsteps_logits, dims=1) # [7 × s × b]
+        nsteps_logls = log.(nsteps_probs) # [7 × s × b]
+        beam_scores = Float32(1.0) .- nsteps_logls[7:7, si, :] # [1, b]
+
+        # The beam scores are the base beam scores plus the action log likelihoods
+        candidate_beam_scores = beam_scores .+ action_logls[:, si, :] # [4, b]
 
         # Get the top 'b' beams
+        candidate_beam_scores_flat = vec(candidate_beam_scores) # [4b]
         topk_indices = partialsortperm(candidate_beam_scores_flat, 1:b; rev=true)
 
         # Convert flat indices back to action and beam indices
@@ -1561,10 +1571,16 @@ function beam_search!(
         actions[si,:] = selected_actions
 
         # Apply the actions to the selected beams
-        inputs = advance_board_inputs(inputs_gpu, actions)
+        inputs_gpu = advance_board_inputs(inputs_gpu, actions)
+
+        if any(are_solved(inputs_gpu)[si,:])
+            break
+        end
+
+        si += 1
     end
 
-    return (cpu(inputs_gpu), cpu(actions))
+    return (cpu(inputs_gpu), cpu(actions), si)
 end
 
 # --------------------------------------------------------------------------
@@ -1624,112 +1640,6 @@ function rollouts!(
     end
 
     return cpu(inputs_gpu)
-end
-
-mutable struct RolloutData0
-    inputs::Array{Bool}     # [8×8×5×s×b] or [e×s×b]
-    moves::Array{Direction} # [s×b] The moves for the rollouts
-    rewards::Array{Float32} # [s×b] The per-step rewards
-    depths::Vector{Int}     # [b] How deep each rollout is
-end
-
-# Run the model in parallel to produce rollouts
-function rollout!(
-    data::RolloutData0,
-    policy::SokobanPolicyLevel0,
-    s_starts::Vector{Board}, # [b] the starting boards
-    s_goals::Vector{Board};  # [b] the goal boards
-    policy_dirichlet_prior::Float32 = 0.0f0,
-    reward_bad_move::Float32 = -0.1f0, # reward obtained for a step that runs into a wall
-    reward_solve::Float32    =  1.0f0, # reward obtained for solving a puzzle
-    )
-
-    policy = gpu(policy)
-    inputs_cpu = data.inputs
-    moves = data.moves
-    rewards = data.rewards
-    depths = data.depths
-
-    s = size(inputs_cpu, 4)
-    b = size(inputs_cpu, 5)
-
-    @assert length(s_starts) == b
-    @assert length(s_goals) == b
-    @assert size(inputs_cpu) == (8, 8, 5, s, b)
-    @assert size(moves) == (s,b)
-    @assert size(rewards) == (s,b)
-    @assert length(depths) == b
-
-    fill!(moves, DIR_UP)
-    fill!(rewards, zero(Float32))
-    fill!(depths, 0)
-
-    num_running = b
-    is_done = falses(b) # keep track of whether each rollout is done
-    states = [State(Game(board)) for board in s_starts]
-
-    # Fill the goals into the first sequence channel
-    for (bi, s_goal) in enumerate(s_goals)
-        set_board_input!(inputs_cpu, s_goal, 1, bi)
-    end
-
-    # Fill the start states in the next sequence channel
-    for (bi, s_start) in enumerate(s_starts)
-        set_board_input!(inputs_cpu, s_start, 2, bi)
-    end
-
-    for si in 2:s
-        if num_running ≤ 0
-            break
-        end
-
-        # Run the model
-        # policy_logits are [4 × s × b]
-        # nsteps_logits are [7 × s × b]
-        policy_logits_gpu, nsteps_logits_gpu = policy(gpu(inputs_cpu))
-
-        # Pull out the logits for our current sequence index.
-        policy_logits_seq = cpu(policy_logits_gpu)[:,si,:] # [4 × b]
-
-        # Optionally bias the policy logits.
-        policy_logits_seq[:,:] .+= policy_dirichlet_prior # [4 × b]
-
-        # Sample from the action logits using the Gumbel-max trick
-        gumbel_noise = rand(Gumbel{Float32}(0.0f0, 1.0f0), size(policy_logits_seq))
-        sampled_actions = argmax(policy_logits_seq .+ gumbel_noise, dims=1)
-
-        # Apply the actions
-        for bi in 1:b
-            if is_done[bi]
-                continue # no need to simulate this one any further
-            end
-
-            # Grab the sampled action
-            ai = sampled_actions[bi][1]
-            dir = Direction(ai)
-            moves[si,bi] = dir
-
-            # Increase the depth by one
-            depths[bi] += 1
-
-            # Simulate the state forward
-            successful_move = maybe_move!(states[bi], dir)
-            rewards[si, bi] += !successful_move * reward_bad_move
-
-            if is_solved(states[bi])
-                is_done[bi] = true
-                num_running -= 1
-                rewards[si, bi] += reward_solve
-            end
-
-            # Fill in the next input
-            if si < s
-                set_board_input!(inputs_cpu, states[bi].board, si+1, bi)
-            end
-        end
-    end
-
-    return data
 end
 
 # --------------------------------------------------------------------------
@@ -1864,9 +1774,11 @@ end
 
 function calc_metrics_gpu(
     policy::SokobanPolicyLevel0,
-    data::BeamSearchData,
+    inputs::Array{Bool, 5},      # [h×w×f×s×b]
     validation_set::Vector{TrainingEntry0},
     )
+
+    s = size(inputs,4)
 
     policy = gpu(policy)
 
@@ -1880,22 +1792,26 @@ function calc_metrics_gpu(
     accumulated_solution_length = 0
 
     for training_entry in validation_set
-        beam_search!(data, training_entry.s_start, training_entry.s_goal, policy)
 
-        if data.solution == -1 # failed
+        gumbel_noise = sample_gumbel_noise(policy.max_seq_len, policy.batch_size)
+        inputs, actions, depth = beam_search!(inputs, policy, training_entry.s_start, training_entry.s_goal)
+
+        is_solved = depth < s
+
+        if !is_solved
             if has_solution(training_entry)
                 n_failed_fp += 1 # we should not have failed this one
             else
                 n_failed_tp += 1 # we expected not to solve this one
             end
-        else
+        else # solved
             if has_solution(training_entry)
                 n_solved_tp += 1 # we had a stored solution for this one
             else
                 n_solved_fp += 1 # this one should not be solvable
             end
 
-            accumulated_solution_length += data.depth
+            accumulated_solution_length += depth
         end
     end
 
@@ -1909,6 +1825,7 @@ function calc_metrics_gpu(
         "solved_fp_rate" => n_solved_fp / m_validation_set,
         "failed_tp_rate" => n_failed_tp / m_validation_set,
         "failed_fp_rate" => n_failed_fp / m_validation_set,
+        "solved_rate" => n_solved_tp / (n_solved_tp + n_failed_fp),
         "average_solution_length" => accumulated_solution_length / (n_solved_tp + n_solved_fp),
     )
 end
